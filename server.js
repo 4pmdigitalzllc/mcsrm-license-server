@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const crypto = require('crypto');
 
@@ -5,48 +6,58 @@ const app = express();
 const port = process.env.PORT || 10000;
 const SECRET = process.env.LEMONSQUEEZY_SIGNING_SECRET || '';
 
-// Für Health & Root
-app.get('/', (req, res) => res.status(200).send('OK'));
-app.get('/health', (req, res) => res.status(200).send('ok'));
+// --- Health & Root ---
+app.get('/', (_req, res) => res.status(200).send('OK'));
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// 1) Roh-Body puffern, damit Signatur stimmt
-app.use('/api/lemon/webhook', express.raw({ type: 'application/json' }));
+// --- WICHTIG: Roh-Body nur für den Webhook parsen ---
+app.use('/api/lemon/webhook', express.raw({ type: 'application/json', limit: '200kb' }));
 
-// 2) Webhook-Route mit viel Logging
+// --- Lemon Squeezy Webhook ---
 app.post('/api/lemon/webhook', (req, res) => {
   try {
-    const raw = req.body; // Buffer
-    const lsSig = req.get('X-Signature') || req.get('x-signature') || '';
-    const event = req.get('X-Event-Name') || req.get('x-event-name') || '';
-    console.log('[Webhook] request received. Event:', event);
-    console.log('[Webhook] headers:', JSON.stringify(req.headers));
+    const raw = req.body; // Buffer (weil express.raw)
+    const lsSig = req.get('x-signature') || '';       // Signatur von Lemon Squeezy
+    const eventHeader = req.get('x-event-name') || ''; // optionaler Event-Header
+
+    console.log('---[Webhook] Incoming---');
+    console.log('[Webhook] Event header:', eventHeader);
+    console.log('[Webhook] Content-Type:', req.get('content-type'));
+    console.log('[Webhook] Raw length:', raw?.length || 0);
 
     if (!SECRET) {
-      console.log('[Webhook] Kein SIGNING_SECRET gesetzt!');
+      console.warn('[Webhook] Kein LEMONSQUEEZY_SIGNING_SECRET gesetzt!');
       return res.status(500).send('missing secret');
     }
     if (!lsSig) {
-      console.log('[Webhook] Keine X-Signature im Header.');
+      console.warn('[Webhook] Keine X-Signature im Header.');
       return res.status(400).send('missing signature');
     }
 
-    // HMAC-SHA256 über den RAW body
+    // HMAC-SHA256 über den *rohen* Body bilden
     const hmac = crypto.createHmac('sha256', SECRET);
     hmac.update(raw);
     const digest = hmac.digest('hex');
 
+    // Schutz: nur vergleichen, wenn gleich lang – sonst wirft timingSafeEqual
+    if (lsSig.length !== digest.length) {
+      console.warn('[Webhook] Signature length mismatch');
+      return res.status(400).send('invalid signature');
+    }
+
     const valid = crypto.timingSafeEqual(Buffer.from(lsSig), Buffer.from(digest));
     console.log('[Webhook] signature valid?', valid);
-
     if (!valid) return res.status(400).send('invalid signature');
 
-    // gültig → JSON parsen und loggen
+    // Gültig → Payload parsen
     const payload = JSON.parse(raw.toString('utf8'));
-    console.log('[Webhook] payload.meta.event_name:', payload?.meta?.event_name);
-    console.log('[Webhook] order id / subscription id:',
-      payload?.data?.id || payload?.data?.attributes?.first_order_id);
+    const eventName = payload?.meta?.event_name || '(unknown)';
+    const orderId = payload?.data?.id || payload?.data?.attributes?.first_order_id;
 
-    // hier würdest du dein Lizenzhandling machen …
+    console.log('[Webhook] meta.event_name:', eventName);
+    console.log('[Webhook] data.id / first_order_id:', orderId);
+
+    // TODO: Hier dein Lizenz-/Abo-Handling einbauen (DB, E-Mail, etc.)
 
     return res.status(200).send('ok');
   } catch (err) {
@@ -55,7 +66,7 @@ app.post('/api/lemon/webhook', (req, res) => {
   }
 });
 
-// Fallback JSON-Parser NACH der Webhook-Route
+// Alle anderen Routen: normales JSON
 app.use(express.json());
 
 app.listen(port, () => {
