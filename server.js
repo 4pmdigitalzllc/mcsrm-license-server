@@ -2,7 +2,9 @@ const express = require("express");
 const app = express();
 
 // Health check
-app.get("/health", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
 
 // LemonSqueezy webhook
 app.post("/api/lemon/webhook", express.raw({ type: "*/*" }), (req, res) => {
