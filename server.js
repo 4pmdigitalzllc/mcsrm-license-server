@@ -5,89 +5,74 @@ const app = express();
 const port = process.env.PORT || 10000;
 const SECRET = process.env.LEMONSQUEEZY_SIGNING_SECRET || '';
 
-// --- Health & Root (damit Render nicht nur die Splash zeigt) ---
-app.get('/', (req, res) => res.status(200).send('OK'));
-app.get('/health', (req, res) => res.status(200).send('ok'));
+app.set('trust proxy', true);
 
-// --- Helper: akzeptiere application/json ODER application/vnd.api+json ---
-const rawJson = express.raw({
-  type: (req) => {
-    const ct = (req.headers['content-type'] || '').toLowerCase();
-    return ct.includes('application/json') || ct.includes('application/vnd.api+json');
-  }
+// --- Leichte Diagnose: jede Anfrage kurz loggen (ohne Body zu lesen!) ---
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.originalUrl}  ct=${req.headers['content-type'] || '-'}  ua=${req.headers['user-agent'] || '-'}`);
+  next();
 });
 
-// --- Dieselbe Webhook-Logik auf zwei Pfaden zulassen (falls sich die URL vertut) ---
-const WEBHOOK_PATHS = ['/api/lemon/webhook', '/lemon/webhook'];
+// Health & Root
+app.get('/', (_req, res) => res.status(200).send('OK'));
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Webhook-Handler
-function handleWebhook(req, res) {
+// WICHTIG: RAW Body auf der Webhook-Route – akzeptiere *alle* Typen
+app.use('/api/lemon/webhook', express.raw({ type: '*/*' }));
+
+app.post('/api/lemon/webhook', (req, res) => {
   try {
-    const raw = req.body; // Buffer (weil express.raw)
-    const sig = req.get('x-signature') || '';
-    const eventHeader = req.get('x-event-name') || '';
-    console.log('---- WEBHOOK HIT ----');
-    console.log('Path:', req.path);
-    console.log('Event header:', eventHeader);
-    console.log('Content-Type:', req.get('content-type'));
-    console.log('All headers:', JSON.stringify(req.headers));
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    const lsSig = req.get('X-Signature') || req.get('x-signature') || '';
+    const event = req.get('X-Event-Name') || req.get('x-event-name') || '';
+
+    console.log(`[Webhook] hit. event="${event}" len=${raw.length}B sigPresent=${!!lsSig}`);
 
     if (!SECRET) {
-      console.log('!! Kein SIGNING_SECRET gesetzt');
+      console.log('[Webhook] ERROR: LEMONSQUEEZY_SIGNING_SECRET fehlt.');
       return res.status(500).send('missing secret');
     }
-    if (!sig) {
-      console.log('!! Keine X-Signature im Header');
+    if (!lsSig) {
+      console.log('[Webhook] ERROR: X-Signature fehlt.');
       return res.status(400).send('missing signature');
     }
-    if (!Buffer.isBuffer(raw)) {
-      console.log('!! Body ist kein Buffer (Parser falsch?)');
-      return res.status(400).send('invalid body');
+    if (!raw || raw.length === 0) {
+      console.log('[Webhook] ERROR: raw body leer.');
+      return res.status(400).send('empty body');
     }
 
-    // HMAC bilden und sicher vergleichen
-    const hmac = crypto.createHmac('sha256', SECRET);
-    hmac.update(raw);
-    const digest = hmac.digest('hex');
+    // HMAC über den RAW-Body
+    const digest = crypto.createHmac('sha256', SECRET).update(raw).digest('hex');
 
-    if (sig.length !== digest.length) {
-      console.log('!! Signature length mismatch');
-      return res.status(400).send('invalid signature');
+    let valid = false;
+    try {
+      // Falls LS je "sha256=..." senden würde, den Präfix abwerfen
+      const cleanSig = lsSig.startsWith('sha256=') ? lsSig.slice(7) : lsSig;
+      valid = crypto.timingSafeEqual(Buffer.from(cleanSig), Buffer.from(digest));
+    } catch {
+      valid = false;
     }
-    const valid = crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest));
-    console.log('Signature valid?', valid);
+
+    console.log(`[Webhook] signature valid? ${valid} (expected=${digest.slice(0,12)}…)`);
     if (!valid) return res.status(400).send('invalid signature');
 
-    // Payload parsen & kurz loggen
+    // gültig -> Payload auslesen
     const payload = JSON.parse(raw.toString('utf8'));
-    console.log('meta.event_name:', payload?.meta?.event_name);
-    console.log('data.id:', payload?.data?.id);
+    console.log('[Webhook] meta.event_name:', payload?.meta?.event_name);
+    console.log('[Webhook] data.id:', payload?.data?.id);
 
-    // TODO: Hier dein Lizenz-Handling
+    // TODO: Lizenz-Handling hier …
 
     return res.status(200).send('ok');
   } catch (err) {
-    console.error('Webhook error:', err);
+    console.error('[Webhook] error:', err);
     return res.status(500).send('error');
   }
-}
-
-// Die Routen registrieren (beide Pfade)
-for (const p of WEBHOOK_PATHS) {
-  app.post(p, rawJson, handleWebhook);
-}
-
-// --- Debug: fängt alle POSTs ab und loggt (hilft beim 404-Suchen) ---
-app.post('*', express.raw({ type: '*/*' }), (req, res) => {
-  console.log('Unmatched POST:', req.path, 'CT=', req.get('content-type'));
-  return res.status(404).send('no route for ' + req.path);
 });
 
-// JSON-Parser NACH dem Webhook (damit dort der RAW-Body verfügbar bleibt)
+// JSON-Parser NACH der Webhook-Route
 app.use(express.json());
 
 app.listen(port, () => {
-  // SECRET gekürzt loggen (nur zur Kontrolle während Tests)
-  const tail = SECRET ? SECRET.slice(-6) : 'none';
-  console.log(`Listening on port ${port} | SECRET tail: ${tail}`);
+  console.log(`Listening on port ${port}`);
 });
