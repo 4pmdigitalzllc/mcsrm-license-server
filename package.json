@@ -2,9 +2,13 @@
   "name": "mscrm-license-server",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": ">=18" },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "render-build": "echo 'no build step'"
   },
   "dependencies": {
     "express": "^4.19.2"
