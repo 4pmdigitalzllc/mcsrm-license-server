@@ -1,10 +1,10 @@
 // server.js
 const express = require('express');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const crypto  = require('crypto');
+const fs      = require('fs');
+const path    = require('path');
 
-const app = express();
+const app  = express();
 const port = process.env.PORT || 10000;
 const SECRET = process.env.LEMONSQUEEZY_SIGNING_SECRET || '';
 
@@ -20,8 +20,8 @@ app.use((req, res, next) => {
 });
 
 // --- health / root
-app.get('/', (req, res) => res.status(200).send('OK'));
-app.get('/health', (req, res) => res.status(200).send('ok'));
+app.get('/',      (req, res) => res.status(200).send('OK'));
+app.get('/health',(req, res) => res.status(200).send('ok'));
 
 // -------- persistence helpers --------
 function loadDb(){
@@ -30,20 +30,19 @@ function loadDb(){
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       return JSON.parse(raw||'{}');
     }
-  }catch{}
+  }catch(e){ console.error('[DB] read error:', e); }
   return { accounts:{} }; // accounts[email] = { seats: [ {id, assignedToModelId|null, assignedToModelName|null} ] }
 }
 function saveDb(db){
   try{
     fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8');
-  }catch(e){
-    console.error('[DB] write error:', e);
-  }
+  }catch(e){ console.error('[DB] write error:', e); }
 }
 function ensureAcc(db, email){
-  db.accounts = db.accounts || {};
-  db.accounts[email] = db.accounts[email] || { seats: [] };
-  return db.accounts[email];
+  const key = String(email||'').toLowerCase();
+  if (!db.accounts) db.accounts = {};
+  if (!db.accounts[key]) db.accounts[key] = { seats: [] };
+  return db.accounts[key];
 }
 
 // -------- lemon webhook (raw body) --------
@@ -51,7 +50,7 @@ app.use('/api/lemon/webhook', express.raw({ type: 'application/json' }));
 
 app.post('/api/lemon/webhook', (req, res) => {
   try {
-    const raw = req.body; // Buffer
+    const raw   = req.body; // Buffer
     const lsSig = req.get('X-Signature') || req.get('x-signature') || '';
     const event = req.get('X-Event-Name') || req.get('x-event-name') || '';
     console.log('[Webhook] hit. event:', event, 'len=', raw?.length||0);
@@ -67,14 +66,16 @@ app.post('/api/lemon/webhook', (req, res) => {
     console.log('[Webhook] signature valid?', valid);
     if (!valid) return res.status(400).send('invalid signature');
 
-    const payload = JSON.parse(raw.toString('utf8'));
+    let payload = {};
+    try{ payload = JSON.parse(raw.toString('utf8')); }catch(e){ console.error('[Webhook] JSON parse error:', e); }
     const eventName = payload?.meta?.event_name || event || 'unknown';
     console.log('[Webhook] payload.meta.event_name:', eventName);
 
-    // Für MVP: bei "order_created" die Seat-Anzahl um "quantity" erhöhen
+    // MVP: bei "order_created" die Seat-Anzahl um "quantity" erhöhen
     if (eventName === 'order_created') {
-      const email = payload?.data?.attributes?.user_email;
+      const emailRaw = payload?.data?.attributes?.user_email;
       const qty   = Number(payload?.data?.attributes?.first_order_item?.quantity || 1);
+      const email = String(emailRaw||'').toLowerCase();
       if (email && qty > 0){
         const db = loadDb();
         const acc = ensureAcc(db, email);
@@ -87,8 +88,7 @@ app.post('/api/lemon/webhook', (req, res) => {
         console.log('[Webhook] order_created without email/qty');
       }
     }
-
-    // Hinweis: Weitere Events (license_key_created, subscription_created/updated/cancelled) können wir später ergänzen.
+    // Weitere Events (license_key_created, subscription_* ) können später ergänzt werden.
 
     return res.status(200).send('ok');
   } catch (err) {
@@ -121,20 +121,19 @@ app.get('/api/licenses/status', (req, res)=>{
 
 // POST /api/licenses/assign  { email, modelId, modelName }
 app.post('/api/licenses/assign', (req, res)=>{
-  const { email, modelId, modelName } = req.body||{};
-  if (!email || !String(email).includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
+  const email = String(req.body?.email||'').toLowerCase();
+  const modelId   = req.body?.modelId;
+  const modelName = req.body?.modelName;
+  if (!email || !email.includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
   if (!modelId) return res.status(400).json({ ok:false, msg:'modelId missing' });
 
   const db = loadDb();
-  const acc = ensureAcc(db, String(email).toLowerCase());
+  const acc = ensureAcc(db, email);
   const seats = acc.seats || [];
 
-  // schon belegt?
   if (seats.find(s=>s.assignedToModelId === modelId)){
     return res.json({ ok:true, msg:'already assigned' });
   }
-
-  // freien Seat suchen
   const free = seats.find(s=>!s.assignedToModelId);
   if (!free) return res.status(409).json({ ok:false, msg:'no free seat' });
 
@@ -147,12 +146,13 @@ app.post('/api/licenses/assign', (req, res)=>{
 
 // POST /api/licenses/release  { email, modelId }
 app.post('/api/licenses/release', (req, res)=>{
-  const { email, modelId } = req.body||{};
-  if (!email || !String(email).includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
+  const email = String(req.body?.email||'').toLowerCase();
+  const modelId = req.body?.modelId;
+  if (!email || !email.includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
   if (!modelId) return res.status(400).json({ ok:false, msg:'modelId missing' });
 
   const db = loadDb();
-  const acc = ensureAcc(db, String(email).toLowerCase());
+  const acc = ensureAcc(db, email);
   const seats = acc.seats || [];
 
   const seat = seats.find(s=>s.assignedToModelId === modelId);
@@ -163,6 +163,11 @@ app.post('/api/licenses/release', (req, res)=>{
 
   saveDb(db);
   res.json({ ok:true });
+});
+
+// --- optional debug (nicht sensibel, nur im Test benutzen)
+app.get('/api/licenses/debug', (req,res)=>{
+  try{ res.json(loadDb()); }catch{ res.json({}); }
 });
 
 // --- start
