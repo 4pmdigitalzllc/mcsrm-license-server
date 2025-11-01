@@ -228,17 +228,7 @@ app.post('/api/licenses/release', (req, res)=>{
  * - robuster Timeout (10s)
  * - sauberes Error-Handling & Logging
  */
-async function createPortalSession(email) {
-  if (!email || !email.includes('@')) {
-    return { ok:false, msg:'email missing' };
-  }
-  if (!LS_KEY) {
-    console.error('[Portal] LEMONSQUEEZY_API_KEY missing on server');
-    return { ok:false, msg:'LEMONSQUEEZY_API_KEY missing on server' };
-  }
-  if (!fetchFn) {
-    return { ok:false, msg:'fetch not available on server (install node-fetch or use Node 18+)' };
-  }
+const LICENSE_API_BASE = "https://mcsrm-license-server.onrender.com";
 
   // Timeout-Wrapper: Node 18 hat AbortController; Fallback mit Promise.race
   const timeoutMs = 10000;
