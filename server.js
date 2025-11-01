@@ -3,7 +3,7 @@
 // Multi-Session CRM License Server (Express)
 // - Lemon Squeezy Webhook (Seats-Verwaltung)
 // - Lizenz-Status / Assign / Release
-// - Billing-Portal Endpunkte (JSON + Redirect) mit Timeout & Debug-Bypass
+// - Billing-Portal Endpunkte (JSON + Redirect) mit Timeout & Debug
 // ============================================================================
 
 const express = require('express');
@@ -40,8 +40,9 @@ const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Secrets / Keys aus Environment (Render Dashboard) ---------------------
-const SECRET  = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // für Webhook-Signatur
-const LS_KEY  = process.env.LEMONSQUEEZY_API_KEY || '';        // für Billing-Portal API
+const SECRET  = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook-Signatur
+const LS_KEY  = process.env.LEMONSQUEEZY_API_KEY || '';        // Lemon API
+const STORE_ID = process.env.LEMON_STORE_ID || '';             // optional
 
 // ---- Mini-DB (Datei) -------------------------------------------------------
 const DATA_FILE = path.join(process.cwd(), 'licenses.json');
@@ -97,7 +98,7 @@ app.post('/api/lemon/webhook', (req, res) => {
     if (!SECRET) { console.log('[Webhook] missing SECRET'); return res.status(500).send('missing secret'); }
     if (!lsSig)  { console.log('[Webhook] missing signature'); return res.status(400).send('missing signature'); }
 
-    // HMAC prüfen (sicher: nur vergleichen, wenn Längen gleich sind)
+    // HMAC prüfen
     const hmac = crypto.createHmac('sha256', SECRET);
     hmac.update(raw);
     const digestHex = hmac.digest('hex');
@@ -107,9 +108,8 @@ app.post('/api/lemon/webhook', (req, res) => {
       const a = Buffer.from(lsSig);
       const b = Buffer.from(digestHex);
       valid = (a.length === b.length) && crypto.timingSafeEqual(a, b);
-    }catch(e){
-      valid = false;
-    }
+    }catch{ valid = false; }
+
     console.log('[Webhook] signature valid?', valid);
     if (!valid) return res.status(400).send('invalid signature');
 
@@ -137,8 +137,6 @@ app.post('/api/lemon/webhook', (req, res) => {
       }
     }
 
-    // weitere events (subscription_*) bei Bedarf ergänzen
-
     return res.status(200).send('ok');
   } catch (err) {
     console.error('[Webhook] error:', err);
@@ -152,7 +150,6 @@ app.post('/api/lemon/webhook', (req, res) => {
 app.use(express.json());
 
 // -------- LICENSE STATUS ----------------------------------------------------
-// GET /api/licenses/status?email=...
 app.get('/api/licenses/status', (req, res)=>{
   const email = String(req.query.email||'').trim().toLowerCase();
   if (!email || !email.includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
@@ -162,17 +159,10 @@ app.get('/api/licenses/status', (req, res)=>{
   const seats = acc.seats || [];
   const used  = seats.filter(s=>!!s.assignedToModelId).length;
 
-  res.json({
-    ok:true,
-    email,
-    totalSeats: seats.length,
-    usedSeats: used,
-    seats
-  });
+  res.json({ ok:true, email, totalSeats: seats.length, usedSeats: used, seats });
 });
 
 // -------- LICENSE ASSIGN ----------------------------------------------------
-// POST /api/licenses/assign  { email, modelId, modelName }
 app.post('/api/licenses/assign', (req, res)=>{
   const email     = String(req.body?.email||'').toLowerCase();
   const modelId   = req.body?.modelId;
@@ -198,7 +188,6 @@ app.post('/api/licenses/assign', (req, res)=>{
 });
 
 // -------- LICENSE RELEASE ---------------------------------------------------
-// POST /api/licenses/release  { email, modelId }
 app.post('/api/licenses/release', (req, res)=>{
   const email   = String(req.body?.email||'').toLowerCase();
   const modelId = req.body?.modelId;
@@ -225,54 +214,73 @@ app.post('/api/licenses/release', (req, res)=>{
 
 /**
  * Lemon Billing-Portal Session anfordern
- * - robuster Timeout (10s)
- * - sauberes Error-Handling & Logging
+ * - richtiger Endpoint: /v1/billing-portals (plural)
+ * - Accept-Header: application/vnd.api+json (empfohlen)
+ * - 10s Timeout mit AbortController/Promise.race
  */
-const LICENSE_API_BASE = "https://mcsrm-license-server.onrender.com";
+async function createPortalSession(email) {
+  if (!email || !email.includes('@')) {
+    return { ok:false, msg:'email missing' };
+  }
+  if (!LS_KEY) {
+    return { ok:false, msg:'LEMONSQUEEZY_API_KEY missing on server' };
+  }
+  if (!fetchFn) {
+    return { ok:false, msg:'fetch not available on server (install node-fetch or use Node 18+)' };
+  }
 
-  // Timeout-Wrapper: Node 18 hat AbortController; Fallback mit Promise.race
   const timeoutMs = 10000;
-  let controller;
-  let timer;
 
-  const doFetch = () => fetchFn('https://api.lemonsqueezy.com/v1/billing-portal', {
+  const body = {
+    data: {
+      type: 'billing-portals',
+      attributes: { email }
+    }
+  };
+
+  // optional Store-Scope
+  if (STORE_ID) {
+    body.data.relationships = {
+      store: { data: { type: 'stores', id: String(STORE_ID) } }
+    };
+  }
+
+  const doFetch = (signal) => fetchFn('https://api.lemonsqueezy.com/v1/billing-portals', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${LS_KEY}`,
       'Content-Type': 'application/json',
-      'Accept': 'application/json'
+      'Accept': 'application/vnd.api+json'
     },
-    body: JSON.stringify({
-      data: { type: 'billing-portals', attributes: { email } }
-    }),
-    ...(typeof AbortController !== 'undefined'
-        ? ((controller = new AbortController()), { signal: controller.signal })
-        : {})
+    body: JSON.stringify(body),
+    signal
   });
 
   try {
     let resp;
     if (typeof AbortController !== 'undefined') {
-      timer = setTimeout(()=> { try{ controller.abort(); }catch{} }, timeoutMs);
-      resp = await doFetch();
-      clearTimeout(timer);
+      const controller = new AbortController();
+      const t = setTimeout(()=> controller.abort(), timeoutMs);
+      resp = await doFetch(controller.signal);
+      clearTimeout(t);
     } else {
       resp = await Promise.race([
-        doFetch(),
+        doFetch(undefined),
         (async ()=>{ await sleep(timeoutMs); throw new Error('timeout'); })()
       ]);
     }
 
     const data = await resp.json().catch(()=> ({}));
-    console.log('[Portal] Lemon API status=', resp.status);
+    console.log('[Portal] Lemon API status:', resp.status);
 
     if (!resp.ok) {
       console.error('[Portal] Lemon API error payload:', data);
       return { ok:false, msg:'Lemon API error', data };
     }
+
     const url = data?.data?.attributes?.url;
     if (!url) {
-      console.error('[Portal] response missing url:', data);
+      console.error('[Portal] missing url:', data);
       return { ok:false, msg:'portal url missing', data };
     }
     return { ok:true, url };
@@ -287,26 +295,20 @@ const LICENSE_API_BASE = "https://mcsrm-license-server.onrender.com";
 }
 
 /**
- * JSON-API
- * POST /api/licenses/portal  { email }
+ * JSON-API: POST /api/licenses/portal  { email }
  * -> { ok:true, url:"..." }
- *
- * Zusätzlich: GET /api/licenses/portal?debug=1  (schneller Frontend-Test)
- * -> { ok:true, url:"https://example.com" }
+ * Debug: GET /api/licenses/portal?debug=1
  */
 app.all('/api/licenses/portal', async (req, res) => {
   try{
-    // Debug-Bypass erlaubt GET (kein Lemon-Call, sofort Response)
     if (req.method === 'GET' && String(req.query.debug||'') === '1') {
-      console.log('[Portal] debug=1 → return dummy url');
       return res.json({ ok: true, url: 'https://example.com' });
     }
-
     const email = String(
       req.method === 'POST' ? req.body?.email : req.query?.email
     ).trim().toLowerCase();
 
-    console.log(`[Portal] hit method=${req.method} email=${email||'-'}`);
+    console.log('[Portal] hit', req.method, email||'-');
 
     const out = await createPortalSession(email);
     if (!out.ok) return res.status(500).json(out);
