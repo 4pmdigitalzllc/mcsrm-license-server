@@ -209,85 +209,52 @@ app.post('/api/licenses/release', (req, res)=>{
 });
 
 // ============================================================================
-// =======  BILLING-PORTAL (Manage Licenses / Billing) ========================
+// =======  BILLING-PORTAL (Manage Licenses / Billing) — ohne Lemon-API =======
 // ============================================================================
 
-/**
- * Lemon Billing-Portal Session anfordern
- * - richtiger Endpoint: /v1/billing-portals (plural)
- * - Accept-Header: application/vnd.api+json (empfohlen)
- * - 10s Timeout mit AbortController/Promise.race
- */
-async function createPortalSession(email) {
-  if (!email || !email.includes('@')) {
-    return { ok:false, msg:'email missing' };
-  }
-  if (!LS_KEY) {
-    return { ok:false, msg:'LEMONSQUEEZY_API_KEY missing on server' };
-  }
-  if (!fetchFn) {
-    return { ok:false, msg:'fetch not available on server (install node-fetch or use Node 18+)' };
-  }
+// .env/Render: LEMONS_STORE=4pmdigitalz   (dein Store-Subdomain-Name)
+function createPortalSession(email) {
+  const store = (process.env.LEMONS_STORE || '').trim(); // z.B. "4pmdigitalz"
+  if (!store) return { ok: false, msg: 'LEMONS_STORE missing' };
 
-  const baseHeaders = {
-    'Authorization': `Bearer ${LS_KEY}`,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
+  const base = `https://${store}.lemonsqueezy.com/billing`;
+  const url  = email ? `${base}?email=${encodeURIComponent(email)}` : base;
 
-  try {
-    // 1) Kunde per E-Mail suchen
-    const q = new URLSearchParams({ 'filter[email]': email }).toString();
-    const find = await fetchFn(`https://api.lemonsqueezy.com/v1/customers?${q}`, {
-      method: 'GET',
-      headers: baseHeaders
-    });
-    const customers = await find.json().catch(() => ({}));
-
-    if (!find.ok) {
-      console.error('[Portal] customers lookup failed:', customers);
-      return { ok:false, msg:'customers lookup failed', data: customers };
-    }
-    const customerId = customers?.data?.[0]?.id;
-    if (!customerId) {
-      return { ok:false, msg:`no Lemon customer for ${email}` };
-    }
-
-    // 2) Billing-Portal-Session erstellen (ACHTUNG: singular /v1/billing-portal)
-    const body = {
-      data: {
-        type: 'billing-portals',
-        attributes: { customer_id: customerId }
-      }
-    };
-
-    const resp = await fetchFn('https://api.lemonsqueezy.com/v1/billing-portal', {
-      method: 'POST',
-      headers: baseHeaders,
-      body: JSON.stringify(body)
-    });
-
-    const data = await resp.json().catch(() => ({}));
-    console.log('[Portal] Lemon API status:', resp.status);
-
-    if (!resp.ok) {
-      console.error('[Portal] Lemon API error payload:', data);
-      return { ok:false, msg:'Lemon API error', data };
-    }
-
-    const url = data?.data?.attributes?.url;
-    if (!url) {
-      console.error('[Portal] response missing url:', data);
-      return { ok:false, msg:'portal url missing', data };
-    }
-
-    return { ok:true, url };
-  } catch (e) {
-    console.error('[Portal] server error:', e);
-    return { ok:false, msg:'server error' };
-  }
+  return { ok: true, url };
 }
 
+// JSON-Variante (falls du sie brauchst)
+app.all('/api/licenses/portal', async (req, res) => {
+  try {
+    if (req.method === 'GET' && String(req.query.debug || '') === '1') {
+      return res.json({ ok: true, url: 'https://example.com' });
+    }
+    const email = String(
+      req.method === 'POST' ? req.body?.email : req.query?.email
+    ).trim().toLowerCase();
+
+    const out = createPortalSession(email);
+    if (!out.ok) return res.status(500).json(out);
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ ok:false, msg:'route error' });
+  }
+});
+
+// Redirect-Endpoints für window.open()
+app.get('/api/billing/portal', async (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  const out = createPortalSession(email);
+  if (!out.ok) return res.status(500).json(out);
+  return res.redirect(302, out.url);
+});
+
+app.post('/api/billing/portal', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const out = createPortalSession(email);
+  if (!out.ok) return res.status(500).json(out);
+  return res.redirect(302, out.url);
+});
 /**
  * JSON-API: POST /api/licenses/portal  { email }
  * -> { ok:true, url:"..." }
