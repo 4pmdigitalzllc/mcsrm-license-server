@@ -1,9 +1,9 @@
 // server.js
 // ============================================================================
 // Multi-Session CRM License Server (Express)
-// - Lemon Squeezy Webhook (Seats-Verwaltung)
+// - Lemon Squeezy Webhook (Seats-Verwaltung + Account-Lock bei Payment-Issues)
 // - Lizenz-Status / Assign / Release
-// - Billing-Portal Endpunkte (JSON + Redirect) mit Timeout & Debug
+// - Billing-Portal Endpunkte (JSON + Redirect) ohne Lemon-API
 // ============================================================================
 
 const express = require('express');
@@ -11,20 +11,7 @@ const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
 
-// -------- fetch helper (Node < 18 Kompatibilität) ---------------------------
-let fetchFn = global.fetch;
-if (!fetchFn) {
-  try {
-    const nf = require('node-fetch');           // v2/v3 kompatibel
-    fetchFn = nf.default || nf;
-  } catch (e) {
-    console.warn('[Init] node-fetch nicht gefunden. Installiere ggf.: npm i node-fetch@2');
-  }
-}
-
 // -------- kleine Utils -------------------------------------------------------
-const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
-
 function safeJsonParse(bufOrStr){
   try{
     if (Buffer.isBuffer(bufOrStr)) return JSON.parse(bufOrStr.toString('utf8'));
@@ -32,7 +19,6 @@ function safeJsonParse(bufOrStr){
   }catch(e){}
   return {};
 }
-
 function nowIso(){ return new Date().toISOString(); }
 
 // ----------------------------------------------------------------------------
@@ -40,9 +26,8 @@ const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Secrets / Keys aus Environment (Render Dashboard) ---------------------
-const SECRET  = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook-Signatur
-const LS_KEY  = process.env.LEMONSQUEEZY_API_KEY || '';        // Lemon API
-const STORE_ID = process.env.LEMON_STORE_ID || '';             // optional
+const SECRET = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook-Signatur
+const LEMONS_STORE = (process.env.LEMONS_STORE || '').trim(); // z.B. "4pmdigitalz"
 
 // ---- Mini-DB (Datei) -------------------------------------------------------
 const DATA_FILE = path.join(process.cwd(), 'licenses.json');
@@ -68,7 +53,7 @@ function loadDb(){
       return JSON.parse(raw || '{}');
     }
   }catch(e){ console.error('[DB] read error:', e); }
-  return { accounts:{} }; // accounts[email] = { seats: [ {id, assignedToModelId|null, assignedToModelName|null} ] }
+  return { accounts:{} };
 }
 function saveDb(db){
   try{
@@ -78,8 +63,18 @@ function saveDb(db){
 function ensureAcc(db, email){
   const key = String(email||'').toLowerCase();
   if (!db.accounts) db.accounts = {};
-  if (!db.accounts[key]) db.accounts[key] = { seats: [] };
+  if (!db.accounts[key]) db.accounts[key] = { seats: [], locked:false, lockReason:null };
+  if (typeof db.accounts[key].locked !== 'boolean') db.accounts[key].locked = false;
+  if (!('lockReason' in db.accounts[key])) db.accounts[key].lockReason = null;
   return db.accounts[key];
+}
+function setLockForEmail(email, locked, reason=null){
+  const db  = loadDb();
+  const acc = ensureAcc(db, email);
+  acc.locked = !!locked;
+  acc.lockReason = reason ? String(reason) : null;
+  saveDb(db);
+  console.log(`[Licenses] ${locked?'LOCKED':'UNLOCKED'} ${email} ${reason?'- '+reason:''}`);
 }
 
 // ============================================================================
@@ -98,11 +93,10 @@ app.post('/api/lemon/webhook', (req, res) => {
     if (!SECRET) { console.log('[Webhook] missing SECRET'); return res.status(500).send('missing secret'); }
     if (!lsSig)  { console.log('[Webhook] missing signature'); return res.status(400).send('missing signature'); }
 
-    // HMAC prüfen
+    // HMAC prüfen (Längen beachten für timingSafeEqual)
     const hmac = crypto.createHmac('sha256', SECRET);
     hmac.update(raw);
     const digestHex = hmac.digest('hex');
-
     let valid = false;
     try{
       const a = Buffer.from(lsSig);
@@ -118,7 +112,7 @@ app.post('/api/lemon/webhook', (req, res) => {
     const eventName = payload?.meta?.event_name || eventHdr || 'unknown';
     console.log('[Webhook] payload.meta.event_name:', eventName);
 
-    // MVP: order_created -> Seats um quantity erhöhen
+    // ==== Seats anlegen bei Erstkauf ====
     if (eventName === 'order_created') {
       const emailRaw = payload?.data?.attributes?.user_email;
       const qty      = Number(payload?.data?.attributes?.first_order_item?.quantity || 1);
@@ -137,6 +131,37 @@ app.post('/api/lemon/webhook', (req, res) => {
       }
     }
 
+    // ==== Subscription-Events → Lock/Unlock ====
+    const emailSub = String(payload?.data?.attributes?.user_email || '').toLowerCase();
+    const subStatus = String(payload?.data?.attributes?.status || '').toLowerCase();
+
+    // „schlechte“ Events → lock
+    const shouldLock = (
+      eventName === 'subscription_payment_failed' ||
+      eventName === 'subscription_expired' ||
+      eventName === 'subscription_cancelled' ||
+      eventName === 'subscription_paused'
+    );
+
+    // „gute“ Events → unlock
+    const shouldUnlock = (
+      eventName === 'subscription_payment_success' ||
+      eventName === 'subscription_resumed' ||
+      eventName === 'subscription_updated' ||
+      eventName === 'subscription_renewed' ||
+      eventName === 'subscription_created'
+    );
+
+    if (emailSub) {
+      if (shouldLock)            setLockForEmail(emailSub, true, eventName);
+      else if (shouldUnlock) {
+        // Wenn Status bekannt: nur unlocken, wenn wieder aktiv / Trial
+        if (!subStatus || subStatus === 'active' || subStatus === 'on_trial') {
+          setLockForEmail(emailSub, false, null);
+        }
+      }
+    }
+
     return res.status(200).send('ok');
   } catch (err) {
     console.error('[Webhook] error:', err);
@@ -150,19 +175,29 @@ app.post('/api/lemon/webhook', (req, res) => {
 app.use(express.json());
 
 // -------- LICENSE STATUS ----------------------------------------------------
+// GET /api/licenses/status?email=...
 app.get('/api/licenses/status', (req, res)=>{
   const email = String(req.query.email||'').trim().toLowerCase();
   if (!email || !email.includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
 
   const db    = loadDb();
-  const acc   = db.accounts?.[email] || { seats: [] };
+  const acc   = db.accounts?.[email] || { seats: [], locked:false, lockReason:null };
   const seats = acc.seats || [];
   const used  = seats.filter(s=>!!s.assignedToModelId).length;
 
-  res.json({ ok:true, email, totalSeats: seats.length, usedSeats: used, seats });
+  res.json({
+    ok:true,
+    email,
+    totalSeats: seats.length,
+    usedSeats: used,
+    seats,
+    locked: !!acc.locked,
+    lockReason: acc.lockReason || null
+  });
 });
 
 // -------- LICENSE ASSIGN ----------------------------------------------------
+// POST /api/licenses/assign  { email, modelId, modelName }
 app.post('/api/licenses/assign', (req, res)=>{
   const email     = String(req.body?.email||'').toLowerCase();
   const modelId   = req.body?.modelId;
@@ -172,8 +207,9 @@ app.post('/api/licenses/assign', (req, res)=>{
 
   const db    = loadDb();
   const acc   = ensureAcc(db, email);
-  const seats = acc.seats || [];
+  if (acc.locked) return res.status(403).json({ ok:false, msg:'account locked' });
 
+  const seats = acc.seats || [];
   if (seats.find(s=>s.assignedToModelId === modelId)){
     return res.json({ ok:true, msg:'already assigned' });
   }
@@ -188,6 +224,7 @@ app.post('/api/licenses/assign', (req, res)=>{
 });
 
 // -------- LICENSE RELEASE ---------------------------------------------------
+// POST /api/licenses/release  { email, modelId }
 app.post('/api/licenses/release', (req, res)=>{
   const email   = String(req.body?.email||'').toLowerCase();
   const modelId = req.body?.modelId;
@@ -214,16 +251,13 @@ app.post('/api/licenses/release', (req, res)=>{
 
 // .env/Render: LEMONS_STORE=4pmdigitalz   (dein Store-Subdomain-Name)
 function createPortalSession(email) {
-  const store = (process.env.LEMONS_STORE || '').trim(); // z.B. "4pmdigitalz"
-  if (!store) return { ok: false, msg: 'LEMONS_STORE missing' };
-
-  const base = `https://${store}.lemonsqueezy.com/billing`;
+  if (!LEMONS_STORE) return { ok: false, msg: 'LEMONS_STORE missing' };
+  const base = `https://${LEMONS_STORE}.lemonsqueezy.com/billing`;
   const url  = email ? `${base}?email=${encodeURIComponent(email)}` : base;
-
   return { ok: true, url };
 }
 
-// JSON-Variante (falls du sie brauchst)
+// JSON-Variante (optional, z. B. für Tests)
 app.all('/api/licenses/portal', async (req, res) => {
   try {
     if (req.method === 'GET' && String(req.query.debug || '') === '1') {
@@ -233,10 +267,13 @@ app.all('/api/licenses/portal', async (req, res) => {
       req.method === 'POST' ? req.body?.email : req.query?.email
     ).trim().toLowerCase();
 
+    console.log('[Portal] hit', req.method, email||'-');
+
     const out = createPortalSession(email);
     if (!out.ok) return res.status(500).json(out);
     return res.json(out);
   } catch (e) {
+    console.error('[Portal] route error:', e);
     return res.status(500).json({ ok:false, msg:'route error' });
   }
 });
@@ -252,50 +289,6 @@ app.get('/api/billing/portal', async (req, res) => {
 app.post('/api/billing/portal', async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const out = createPortalSession(email);
-  if (!out.ok) return res.status(500).json(out);
-  return res.redirect(302, out.url);
-});
-/**
- * JSON-API: POST /api/licenses/portal  { email }
- * -> { ok:true, url:"..." }
- * Debug: GET /api/licenses/portal?debug=1
- */
-app.all('/api/licenses/portal', async (req, res) => {
-  try{
-    if (req.method === 'GET' && String(req.query.debug||'') === '1') {
-      return res.json({ ok: true, url: 'https://example.com' });
-    }
-    const email = String(
-      req.method === 'POST' ? req.body?.email : req.query?.email
-    ).trim().toLowerCase();
-
-    console.log('[Portal] hit', req.method, email||'-');
-
-    const out = await createPortalSession(email);
-    if (!out.ok) return res.status(500).json(out);
-    return res.json(out);
-  }catch(e){
-    console.error('[Portal] route error:', e);
-    return res.status(500).json({ ok:false, msg:'route error' });
-  }
-});
-
-/**
- * Kompatible Endpunkte für window.open():
- * GET /api/billing/portal?email=...
- * POST /api/billing/portal { email }
- * -> 302 Redirect direkt ins Lemon-Billing-Portal
- */
-app.get('/api/billing/portal', async (req, res) => {
-  const email = String(req.query.email || '').trim().toLowerCase();
-  const out = await createPortalSession(email);
-  if (!out.ok) return res.status(500).json(out);
-  return res.redirect(302, out.url);
-});
-
-app.post('/api/billing/portal', async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const out = await createPortalSession(email);
   if (!out.ok) return res.status(500).json(out);
   return res.redirect(302, out.url);
 });
