@@ -229,48 +229,45 @@ async function createPortalSession(email) {
     return { ok:false, msg:'fetch not available on server (install node-fetch or use Node 18+)' };
   }
 
-  const timeoutMs = 10000;
-
-  const body = {
-    data: {
-      type: 'billing-portals',
-      attributes: { email }
-    }
+  const baseHeaders = {
+    'Authorization': `Bearer ${LS_KEY}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   };
 
-  // optional Store-Scope
-  if (STORE_ID) {
-    body.data.relationships = {
-      store: { data: { type: 'stores', id: String(STORE_ID) } }
-    };
-  }
-
-  const doFetch = (signal) => fetchFn('https://api.lemonsqueezy.com/v1/billing-portals', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${LS_KEY}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/vnd.api+json'
-    },
-    body: JSON.stringify(body),
-    signal
-  });
-
   try {
-    let resp;
-    if (typeof AbortController !== 'undefined') {
-      const controller = new AbortController();
-      const t = setTimeout(()=> controller.abort(), timeoutMs);
-      resp = await doFetch(controller.signal);
-      clearTimeout(t);
-    } else {
-      resp = await Promise.race([
-        doFetch(undefined),
-        (async ()=>{ await sleep(timeoutMs); throw new Error('timeout'); })()
-      ]);
+    // 1) Kunde per E-Mail suchen
+    const q = new URLSearchParams({ 'filter[email]': email }).toString();
+    const find = await fetchFn(`https://api.lemonsqueezy.com/v1/customers?${q}`, {
+      method: 'GET',
+      headers: baseHeaders
+    });
+    const customers = await find.json().catch(() => ({}));
+
+    if (!find.ok) {
+      console.error('[Portal] customers lookup failed:', customers);
+      return { ok:false, msg:'customers lookup failed', data: customers };
+    }
+    const customerId = customers?.data?.[0]?.id;
+    if (!customerId) {
+      return { ok:false, msg:`no Lemon customer for ${email}` };
     }
 
-    const data = await resp.json().catch(()=> ({}));
+    // 2) Billing-Portal-Session erstellen (ACHTUNG: singular /v1/billing-portal)
+    const body = {
+      data: {
+        type: 'billing-portals',
+        attributes: { customer_id: customerId }
+      }
+    };
+
+    const resp = await fetchFn('https://api.lemonsqueezy.com/v1/billing-portal', {
+      method: 'POST',
+      headers: baseHeaders,
+      body: JSON.stringify(body)
+    });
+
+    const data = await resp.json().catch(() => ({}));
     console.log('[Portal] Lemon API status:', resp.status);
 
     if (!resp.ok) {
@@ -280,15 +277,12 @@ async function createPortalSession(email) {
 
     const url = data?.data?.attributes?.url;
     if (!url) {
-      console.error('[Portal] missing url:', data);
+      console.error('[Portal] response missing url:', data);
       return { ok:false, msg:'portal url missing', data };
     }
+
     return { ok:true, url };
   } catch (e) {
-    if (String(e?.message||'').includes('abort') || String(e?.message||'') === 'timeout') {
-      console.error('[Portal] Lemon API timeout after', timeoutMs, 'ms');
-      return { ok:false, msg:'Lemon API timeout' };
-    }
     console.error('[Portal] server error:', e);
     return { ok:false, msg:'server error' };
   }
