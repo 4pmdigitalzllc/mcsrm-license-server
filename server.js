@@ -3,9 +3,9 @@
 // Multi-Session CRM License Server (Express)
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
 // - Lemon Squeezy Webhook (Seats + Account-Lock)
-// - Rebuild-Route (Seats aus Lemon-API rekonstruieren)
+// - Safe Rebuild (überschreibt lokale Seats NICHT, wenn Lemon 0/Fehler liefert)
 // - Status / Assign / Release
-// - Billing-Portal Redirect (ohne Portal-API)
+// - Billing-Portal Redirect
 // ============================================================================
 
 const express = require('express');
@@ -17,16 +17,34 @@ const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Env -------------------------------------------------------------------
-const SECRET        = process.env.LEMONSQUEEZY_SIGNING_SECRET || '';
-const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim();   // z.B. "4pmdigitalz"
-const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';
+const SECRET        = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook HMAC
+const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim();       // z.B. "4pmdigitalz"
+const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild
 const DATA_FILE     = process.env.DATA_FILE
   ? process.env.DATA_FILE
   : path.join(process.cwd(), 'licenses.json');
+const REBUILD_ON_EVENTS = String(process.env.LEMON_REBUILD_ON_EVENTS || 'false').toLowerCase()==='true';
 
 // ---- Utils -----------------------------------------------------------------
 function nowIso(){ return new Date().toISOString(); }
+function safeJsonParse(x){ try{ return JSON.parse(Buffer.isBuffer(x)?x.toString('utf8'):String(x||'{}')); }catch{return {}; } }
 function ensureDirForFile(file){ try{ fs.mkdirSync(path.dirname(file), { recursive:true }); }catch{} }
+function log(...a){ console.log(...a); }
+
+// ---- CORS (simple) ---------------------------------------------------------
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Headers','content-type, x-signature, x-event-name');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  next();
+});
+
+// ---- Health ----------------------------------------------------------------
+app.get('/',       (req,res)=>res.status(200).send('OK'));
+app.get('/health', (req,res)=>res.status(200).send('ok'));
+
+// ---- Mini-DB (JSON-Datei auf persistenter Disk) ----------------------------
 function loadDb(){
   try{
     if (fs.existsSync(DATA_FILE)) {
@@ -39,19 +57,31 @@ function loadDb(){
   return { accounts:{} };
 }
 function saveDb(db){
-  try{ ensureDirForFile(DATA_FILE); fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8'); }
-  catch(e){ console.error('[DB] write error:', e); }
+  try{
+    ensureDirForFile(DATA_FILE);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8');
+  }catch(e){ console.error('[DB] write error:', e); }
 }
 function ensureAcc(db, email){
   const key = String(email||'').toLowerCase();
   if (!db.accounts) db.accounts = {};
   if (!db.accounts[key]) db.accounts[key] = {
-    seats: [],
+    seats: [],                 // [{ id, assignedToModelId, assignedToModelName }]
     locked:false,
     lockReason:null
   };
+  if (typeof db.accounts[key].locked !== 'boolean') db.accounts[key].locked = false;
+  if (!('lockReason' in db.accounts[key])) db.accounts[key].lockReason = null;
   if (!Array.isArray(db.accounts[key].seats)) db.accounts[key].seats = [];
   return db.accounts[key];
+}
+function setLockForEmail(email, locked, reason=null){
+  const db  = loadDb();
+  const acc = ensureAcc(db, email);
+  acc.locked = !!locked;
+  acc.lockReason = reason ? String(reason) : null;
+  saveDb(db);
+  log(`[Licenses] ${locked?'LOCKED':'UNLOCKED'} ${email} ${reason?'- '+reason:''}`);
 }
 function recalc(acc){
   const seats = acc.seats || [];
@@ -60,138 +90,73 @@ function recalc(acc){
   return acc;
 }
 function resizeSeatsPreservingAssignments(acc, target){
-  const current  = acc.seats || [];
+  const current = acc.seats || [];
   const assigned = current.filter(s => !!s.assignedToModelId);
-  const out = Array.from({ length: target }).map((_, i) => {
+  const newSeats = Array.from({ length: target }).map((_, i) => {
     const prev = assigned[i];
     return prev ? { ...prev } : { id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null };
   });
-  acc.seats = out; recalc(acc);
+  acc.seats = newSeats;
+  recalc(acc);
 }
-
-// E-Mail robust aus Webhook-Payload ziehen
-function getEmailFromPayload(payload){
-  const a = payload?.data?.attributes || {};
-  const m = payload?.meta || {};
-  const cd = m?.custom_data || {};
-
-  const candidates = [
-    a.user_email,             // häufig
-    a.customer_email,         // alternative
-    a.email,                  // fallback
-    cd.email                  // falls im Checkout übergeben
-  ].filter(Boolean).map(x => String(x).trim().toLowerCase());
-
-  // gültige E-Mail wählen
-  const valid = candidates.find(x => x.includes('@'));
-  if (valid) return valid;
-
-  // wenn nur eine “defekte” Variante (ohne '@') existiert, gib sie zurück – Caller kann migrieren
-  return candidates[0] || '';
-}
-
-function setLockForEmail(email, locked, reason=null){
-  const db  = loadDb();
-  const acc = ensureAcc(db, email);
-  acc.locked = !!locked;
-  acc.lockReason = reason ? String(reason) : null;
-  saveDb(db);
-  console.log(`[Licenses] ${locked?'LOCKED':'UNLOCKED'} ${email} ${reason?'- '+reason:''}`);
-}
-
-function migrateSeats(db, fromEmail, toEmail){
-  if (!fromEmail || !toEmail || fromEmail===toEmail) return;
-  const src = db.accounts?.[fromEmail]; const dst = ensureAcc(db, toEmail);
-  if (!src) return;
-  // Hänge alle seats von src an dst an (nur freie Ids generieren, keine Überschneidung)
-  (src.seats||[]).forEach(s => {
-    dst.seats.push({
-      id: crypto.randomUUID(),
-      assignedToModelId: s.assignedToModelId || null,
-      assignedToModelName: s.assignedToModelName || null
-    });
-  });
-  recalc(dst);
-  delete db.accounts[fromEmail];
-  saveDb(db);
-  console.log(`[Migrate] moved ${src.seats?.length||0} seat(s) ${fromEmail} -> ${toEmail}`);
-}
-
-// ---- CORS ------------------------------------------------------------------
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin','*');
-  res.setHeader('Access-Control-Allow-Headers','content-type, x-signature, x-event-name');
-  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  next();
-});
-
-// ---- Health ----------------------------------------------------------------
-app.get('/',       (_req,res)=>res.status(200).send('OK'));
-app.get('/health', (_req,res)=>res.status(200).send('ok'));
 
 // ============================================================================
-// ======================  WEBHOOK  ===========================================
+// ==============  LEMON SQUEEZY WEBHOOK  =====================================
 // ============================================================================
-// Rohkörper NUR hier (HMAC)
+// RAW Body NUR für diese Route (für HMAC-Verifikation)
 app.use('/api/lemon/webhook', express.raw({ type: 'application/json' }));
 
 app.post('/api/lemon/webhook', async (req, res) => {
   try {
-    const raw = req.body;                              // Buffer
-    const sig = req.get('X-Signature') || '';
-    const evh = req.get('X-Event-Name') || '';
-
+    const raw      = req.body; // Buffer
+    const sig      = req.get('X-Signature') || req.get('x-signature') || '';
+    const eventHdr = req.get('X-Event-Name') || req.get('x-event-name') || '';
     if (!SECRET) { console.log('[Webhook] missing SECRET'); return res.status(500).send('missing secret'); }
     if (!sig)    { console.log('[Webhook] missing signature'); return res.status(400).send('missing signature'); }
 
     // HMAC prüfen
-    const h = crypto.createHmac('sha256', SECRET); h.update(raw);
-    const digest = h.digest('hex');
+    const hmac = crypto.createHmac('sha256', SECRET);
+    hmac.update(raw);
+    const digest = hmac.digest('hex');
     let ok = false;
-    try{ ok = crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest)); }catch{ ok = false; }
+    try{
+      const a = Buffer.from(sig);
+      const b = Buffer.from(digest);
+      ok = (a.length===b.length) && crypto.timingSafeEqual(a,b);
+    }catch{ ok=false; }
     if (!ok) return res.status(400).send('invalid signature');
 
-    const payload   = JSON.parse(raw.toString('utf8') || '{}');
-    const eventName = payload?.meta?.event_name || evh || 'unknown';
+    const payload   = safeJsonParse(raw);
+    const eventName = payload?.meta?.event_name || eventHdr || 'unknown';
     const attr      = payload?.data?.attributes || {};
-    const parsed    = getEmailFromPayload(payload);   // robust
-    const looksBroken = parsed && !parsed.includes('@');
-    const email     = parsed;
+    const email     = String(attr?.user_email || attr?.email || '').toLowerCase();
+
     console.log(`[${nowIso()}][Webhook] ${eventName} for ${email||'-'}`);
 
-    const db = loadDb();
+    // --- Seats SOFORT lokal anpassen (nicht auf Rebuild warten) -------------
+    const db  = loadDb();
+    const acc = email ? ensureAcc(db, email) : null;
 
-    // Falls “kaputter” Key ohne '@': nichts verlieren – buche erst mal dort,
-    // versuche aber zusätzlich, Ziel-E-Mail aus anderen Feldern herzuleiten und später zu migrieren.
-    let targetEmail = email;
-    const alt = (attr.customer_email || attr.user_email || '').toLowerCase();
-    const hasAltValid = alt && alt.includes('@');
-
-    // Seats bei order/license events erhöhen
-    const addSeats = (qty) => {
-      const acc = ensureAcc(db, targetEmail);
-      for (let i=0;i<qty;i++){
-        acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
+    // 1) einmalige Orders
+    if (acc && eventName === 'order_created') {
+      const qty = Number(attr?.first_order_item?.quantity || attr?.total_quantity || 1);
+      if (qty > 0){
+        for (let i=0;i<qty;i++){
+          acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
+        }
+        recalc(acc); saveDb(db);
+        console.log(`[Webhook] order_created +${qty} seat(s) -> total=${acc.totalSeats}`);
       }
-      recalc(acc);
-      saveDb(db);
-      console.log(`[Webhook] ${eventName} +${qty} seat(s) -> total=${acc.totalSeats} (${targetEmail})`);
-    };
-
-    // Bestimme Quantity
-    const qtyFromOrder =
-      Number(attr?.first_order_item?.quantity ?? 0) ||
-      Number(attr?.order_items?.[0]?.quantity ?? 0) ||
-      Number(attr?.quantity ?? 0) || 0;
-
-    // Events, die Seats hinzufügen
-    if (eventName === 'order_created' || eventName === 'license_key_created') {
-      const q = Math.max(1, qtyFromOrder || 1);
-      addSeats(q);
     }
 
-    // Lock/Unlock bei Subscriptions
+    // 2) Lizenzschlüssel erstellt (Lemon sendet das im Testmode oft zusätzlich)
+    if (acc && eventName === 'license_key_created') {
+      acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
+      recalc(acc); saveDb(db);
+      console.log(`[Webhook] license_key_created +1 seat(s) -> total=${acc.totalSeats}`);
+    }
+
+    // 3) Sub-Events: Lock/Unlock + (optional) Safe-Rebuild
     const badEvents = new Set(['subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused']);
     const goodEvents= new Set(['subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created']);
 
@@ -202,18 +167,12 @@ app.post('/api/lemon/webhook', async (req, res) => {
         const status = String(attr?.status || '').toLowerCase();
         if (!status || status==='active' || status==='on_trial') setLockForEmail(email, false, null);
       }
-    }
 
-    // Wenn wir eine valide Alt-E-Mail sehen und die aktuelle E-Mail “kaputt” ist:
-    // Seats migrieren (damit zukünftige Status-Abfragen mit richtiger E-Mail funktionieren)
-    if (looksBroken && hasAltValid) {
-      migrateSeats(db, email, alt);
-      // und für Rebuild nutzen wir gleich die valide
-      targetEmail = alt;
+      // Nur wenn gewünscht: Rebuild – aber sicher!
+      if (REBUILD_ON_EVENTS) {
+        try{ await rebuildSeatsFromLemon(email); }catch(e){ console.warn('[Webhook] rebuild skip:', e?.message||e); }
+      }
     }
-
-    // Sicherheitsnetz: aus Lemon neu aufbauen
-    try{ await rebuildSeatsFromLemon(targetEmail); }catch(e){ console.warn('[Webhook] rebuild skip:', e?.message||e); }
 
     return res.status(200).send('ok');
   } catch (err) {
@@ -223,7 +182,7 @@ app.post('/api/lemon/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// ========  ab hier normaler JSON-Parser & API  ==============================
+// =========  ab hier normaler JSON-Parser & API  =============================
 app.use(express.json());
 
 // ---- Lemon API (read-only) für Rebuild -------------------------------------
@@ -235,7 +194,12 @@ async function lemonFetch(v1Path, params = {}){
     Authorization: `Bearer ${LEMON_KEY}`,
     Accept: 'application/vnd.api+json'
   }});
-  if (!r.ok) throw new Error(`Lemon ${v1Path} ${r.status}`);
+  // Bei 401/403/404/400 keine Exception werfen – wir liefern leere Liste zurück,
+  // damit ein Safe-Rebuild NICHT lokale Seats auf 0 setzt.
+  if (!r.ok) {
+    console.warn(`[Orders/Subs] lemon ${v1Path} returned ${r.status}`);
+    return { data: [] };
+  }
   return r.json();
 }
 async function getSeatsFromOrders(email){
@@ -243,11 +207,10 @@ async function getSeatsFromOrders(email){
     const data = await lemonFetch('orders', { 'filter[customer_email]': email });
     const list = Array.isArray(data?.data) ? data.data : [];
     return list.reduce((sum, o)=>{
-      // total_quantity oder quantity – je nach Objekt
       const q = o?.attributes?.total_quantity ?? o?.attributes?.quantity ?? 0;
       return sum + (Number(q)||0);
     }, 0);
-  }catch{ return 0; }
+  }catch{ return null; }
 }
 async function getSeatsFromSubscriptions(email){
   try{
@@ -260,20 +223,36 @@ async function getSeatsFromSubscriptions(email){
       const q = s?.attributes?.quantity ?? s?.attributes?.variant_quantity ?? 1;
       return sum + (Number(q)||0);
     }, 0);
-  }catch{ return 0; }
+  }catch{ return null; }
 }
-async function rebuildSeatsFromLemon(email){
+/** Safe-Rebuild: überschreibt NICHT, wenn Lemon 0 oder Fehler liefert */
+async function rebuildSeatsFromLemon(email, opts={}){
   const key = String(email||'').toLowerCase();
   if (!key) throw new Error('email required');
 
-  const fromOrders = await getSeatsFromOrders(key);
-  const fromSubs   = await getSeatsFromSubscriptions(key);
-  const shouldTotal= (Number(fromOrders)||0) + (Number(fromSubs)||0);
+  const wantForce = !!opts.force;
+
+  const orders = await getSeatsFromOrders(key);
+  const subs   = await getSeatsFromSubscriptions(key);
 
   const db  = loadDb();
   const acc = ensureAcc(db, key);
 
-  if (shouldTotal < 0) { recalc(acc); return acc; }
+  if (orders===null && subs===null) {
+    console.warn('[Rebuild] both endpoints failed -> keep local seats');
+    recalc(acc); saveDb(db);
+    return acc;
+  }
+  const shouldTotal = Number(orders||0) + Number(subs||0);
+
+  // Safe: Wenn Lemon 0 meldet, wir lokal >0 haben und NICHT force – NICHT überschreiben
+  if (!wantForce && shouldTotal===0 && (acc.totalSeats||acc.seats.length)>0) {
+    console.warn('[Rebuild] Lemon said 0, local >0 -> keep local seats');
+    recalc(acc); saveDb(db);
+    console.log(`[Rebuild] ${key} -> (kept) totalSeats=${acc.totalSeats}, used=${acc.usedSeats}`);
+    return acc;
+  }
+
   resizeSeatsPreservingAssignments(acc, shouldTotal);
   saveDb(db);
   console.log(`[Rebuild] ${key} -> totalSeats=${acc.totalSeats}, used=${acc.usedSeats}`);
@@ -286,7 +265,8 @@ app.get('/api/licenses/status', (req, res)=>{
   if (!email || !email.includes('@')) return res.status(400).json({ ok:false, msg:'email missing' });
 
   const db  = loadDb();
-  const acc = ensureAcc(db, email); recalc(acc);
+  const acc = ensureAcc(db, email);
+  recalc(acc);
 
   res.json({
     ok:true,
@@ -344,13 +324,16 @@ app.post('/api/licenses/release', (req, res)=>{
   res.json({ ok:true });
 });
 
-// ---- REBUILD API -----------------------------------------------------------
+// ---- REBUILD API (Recovery / Sync) ----------------------------------------
 app.get('/api/licenses/rebuild', async (req, res)=>{
   try{
     const email = String(req.query.email||'').toLowerCase();
-    if (!email || !email.includes('@')) return res.status(400).json({ ok:false, error:'email required' });
-    const acc = await rebuildSeatsFromLemon(email);
-    res.json({ ok:true, email, totalSeats: acc.totalSeats, usedSeats: acc.usedSeats, seats: acc.seats });
+    if (!email) return res.status(400).json({ ok:false, error:'email required' });
+    const acc = await rebuildSeatsFromLemon(email, { force: String(req.query.force||'')==='1' });
+    res.json({
+      ok:true, email,
+      totalSeats: acc.totalSeats, usedSeats: acc.usedSeats, seats: acc.seats
+    });
   }catch(e){
     console.error('[Rebuild] error', e);
     res.status(500).json({ ok:false, error:'rebuild_failed' });
@@ -358,13 +341,30 @@ app.get('/api/licenses/rebuild', async (req, res)=>{
 });
 
 // ============================================================================
-// =======  BILLING-PORTAL (Manage Licenses) — ohne Portal-API ================
+// =======  BILLING-PORTAL (Manage Licenses / Billing) ========================
 function createPortalSession(email) {
   if (!LEMONS_STORE) return { ok:false, msg:'LEMONS_STORE missing' };
   const base = `https://${LEMONS_STORE}.lemonsqueezy.com/billing`;
   const url  = email ? `${base}?email=${encodeURIComponent(email)}` : base;
   return { ok:true, url };
 }
+
+// JSON-Variante (optional)
+app.all('/api/licenses/portal', async (req, res) => {
+  try {
+    const email = String(
+      req.method === 'POST' ? req.body?.email : req.query?.email
+    ).trim().toLowerCase();
+    const out = createPortalSession(email);
+    if (!out.ok) return res.status(500).json(out);
+    return res.json(out);
+  } catch (e) {
+    console.error('[Portal] route error:', e);
+    return res.status(500).json({ ok:false, msg:'route error' });
+  }
+});
+
+// Redirect-Endpunkte für window.open()
 app.get('/api/billing/portal', (req, res) => {
   const email = String(req.query.email||'').trim().toLowerCase();
   const out = createPortalSession(email);
@@ -378,11 +378,12 @@ app.post('/api/billing/portal', (req, res) => {
   return res.redirect(302, out.url);
 });
 
-// ---- Debug -----------------------------------------------------------------
-app.get('/api/licenses/debug', (_req,res)=>{
+// ---- Debug (nur dev) -------------------------------------------------------
+app.get('/api/licenses/debug', (req,res)=>{
   try{ res.json(loadDb()); }catch{ res.json({}); }
 });
 
+// ---- Start -----------------------------------------------------------------
 app.listen(port, () => {
   console.log(`License server listening on ${port}`);
 });
