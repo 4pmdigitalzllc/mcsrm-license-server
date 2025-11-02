@@ -2,10 +2,10 @@
 // ============================================================================
 // Multi-Session CRM License Server (Express)
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
-// - Lemon Squeezy Webhook (Seats + Account-Lock)
+// - Lemon Squeezy Webhook (Seats + Account-Lock)  [ROBUSTER QTY-PARSER + SUB]
 // - Rebuild-Route (Seats aus Lemon-API rekonstruieren)
 // - Status / Assign / Release
-// - Billing-Portal Redirect (ohne Lemon-Portal-API)
+// - Billing-Portal Session via Lemon API (/api/billing/portal/session)
 // ============================================================================
 
 const express = require('express');
@@ -13,14 +13,16 @@ const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
 
-// ----------------------------------------------------------------------------
+// Node 18+: global fetch verfügbar. Falls nicht, aus node-fetch importieren.
+// const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+
 const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Env -------------------------------------------------------------------
 const SECRET        = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook HMAC
 const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim();       // z.B. "4pmdigitalz"
-const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild
+const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild/Portal
 const DATA_FILE     = process.env.DATA_FILE
   ? process.env.DATA_FILE
   : path.join(process.cwd(), 'licenses.json');
@@ -132,9 +134,21 @@ app.post('/api/lemon/webhook', async (req, res) => {
 
     console.log(`[${nowIso()}][Webhook] ${eventName} for ${email||'-'}`);
 
-    // Seats hinzufügen bei einmaligen Orders (order_created)
+    // ===== Seats hinzufügen bei Orders (robustere Mengen-Extraktion)
     if (eventName === 'order_created') {
-      const qty = Number(attr?.first_order_item?.quantity || 1);
+      let qty = 0;
+
+      // 1) klassisch
+      qty = Number(attr?.first_order_item?.quantity || 0);
+
+      // 2) Fallbacks
+      if (!qty) qty = Number(attr?.total_variants_quantity || 0);
+      if (!qty && Array.isArray(payload?.included)) {
+        qty = payload.included
+          .filter(i => i?.type === 'order-items')
+          .reduce((s, i) => s + Number(i?.attributes?.quantity || 0), 0);
+      }
+
       if (email && qty > 0){
         const db  = loadDb();
         const acc = ensureAcc(db, email);
@@ -143,10 +157,27 @@ app.post('/api/lemon/webhook', async (req, res) => {
         }
         recalc(acc); saveDb(db);
         console.log(`[Webhook] order_created +${qty} seat(s) -> total=${acc.totalSeats}`);
+      } else {
+        console.log('[Webhook] order_created without email/qty', { email, qty });
       }
     }
 
-    // Lock/Unlock nach Sub-Status
+    // ===== Seats bei Sub-Creation anlegen (manche Stores feuern nur Sub-Events)
+    if (eventName === 'subscription_created') {
+      let qty = Number(attr?.quantity || attr?.variant_quantity || 0);
+      if (!qty) qty = 1; // Fallback
+      if (email && qty > 0) {
+        const db  = loadDb();
+        const acc = ensureAcc(db, email);
+        for (let i=0;i<qty;i++){
+          acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
+        }
+        recalc(acc); saveDb(db);
+        console.log(`[Webhook] (sub_created) +${qty} seat(s) -> total=${acc.totalSeats}`);
+      }
+    }
+
+    // ===== Lock/Unlock nach Sub-Status + Rebuild
     const badEvents = new Set(['subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused']);
     const goodEvents= new Set(['subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created']);
 
@@ -154,12 +185,11 @@ app.post('/api/lemon/webhook', async (req, res) => {
       if (badEvents.has(eventName)) {
         setLockForEmail(email, true, eventName);
       } else if (goodEvents.has(eventName)) {
-        // nur unlocken, wenn status aktiv/trial oder Status fehlt
         const status = String(attr?.status || '').toLowerCase();
         if (!status || status==='active' || status==='on_trial') setLockForEmail(email, false, null);
       }
 
-      // Sicherheitsnetz: Bei Sub-Events (good/bad) Seats aus Lemon neu spiegeln
+      // Sicherheitsnetz: Seats aus Lemon neu spiegeln
       try{ await rebuildSeatsFromLemon(email); }catch(e){ console.warn('[Webhook] rebuild skip:', e?.message||e); }
     }
 
@@ -181,7 +211,8 @@ async function lemonFetch(v1Path, params = {}){
   Object.entries(params||{}).forEach(([k,v])=> url.searchParams.set(k, String(v)));
   const r = await fetch(url, { headers:{
     Authorization: `Bearer ${LEMON_KEY}`,
-    Accept: 'application/vnd.api+json'
+    Accept: 'application/vnd.api+json',
+    'Content-Type': 'application/json'
   }});
   if (!r.ok) throw new Error(`Lemon ${v1Path} ${r.status}`);
   return r.json();
@@ -311,39 +342,36 @@ app.get('/api/licenses/rebuild', async (req, res)=>{
 });
 
 // ============================================================================
-// =======  BILLING-PORTAL (Manage Licenses / Billing) — ohne Portal-API ======
-function createPortalSession(email) {
-  if (!LEMONS_STORE) return { ok:false, msg:'LEMONS_STORE missing' };
-  const base = `https://${LEMONS_STORE}.lemonsqueezy.com/billing`;
-  const url  = email ? `${base}?email=${encodeURIComponent(email)}` : base;
+// =======  BILLING-PORTAL (Manage Licenses) — Session via Lemon API ==========
+async function createPortalSessionApi(email) {
+  if (!LEMON_KEY) return { ok:false, msg:'LEMONSQUEEZY_API_KEY missing' };
+  if (!email)     return { ok:false, msg:'email missing' };
+
+  const res = await fetch('https://api.lemonsqueezy.com/v1/billing-portal', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${LEMON_KEY}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      data: { type: 'billing-portal', attributes: { email } }
+    })
+  });
+
+  const j = await res.json().catch(()=>null);
+  const url = j?.data?.attributes?.url;
+  if (!res.ok || !url) {
+    console.error('[Portal API] error', res.status, j);
+    return { ok:false, msg:'api error' };
+  }
   return { ok:true, url };
 }
 
-// JSON-Variante (optional)
-app.all('/api/licenses/portal', async (req, res) => {
-  try {
-    const email = String(
-      req.method === 'POST' ? req.body?.email : req.query?.email
-    ).trim().toLowerCase();
-    const out = createPortalSession(email);
-    if (!out.ok) return res.status(500).json(out);
-    return res.json(out);
-  } catch (e) {
-    console.error('[Portal] route error:', e);
-    return res.status(500).json({ ok:false, msg:'route error' });
-  }
-});
-
-// Redirect-Endpunkte für window.open()
-app.get('/api/billing/portal', (req, res) => {
+// Redirect-Route (ideal für window.open)
+app.get('/api/billing/portal/session', async (req, res) => {
   const email = String(req.query.email||'').trim().toLowerCase();
-  const out = createPortalSession(email);
-  if (!out.ok) return res.status(500).json(out);
-  return res.redirect(302, out.url);
-});
-app.post('/api/billing/portal', (req, res) => {
-  const email = String(req.body?.email||'').trim().toLowerCase();
-  const out = createPortalSession(email);
+  const out = await createPortalSessionApi(email);
   if (!out.ok) return res.status(500).json(out);
   return res.redirect(302, out.url);
 });
