@@ -1,12 +1,11 @@
 // server.js
 // ============================================================================
-// Multi-Session CRM License Server (Redeem-only + Webhook-Lock)
+// Multi-Session CRM License Server (Redeem-only + Webhook-Lock + Seat-Enforcement)
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
-// - KEIN Auto-Insert von Seats via Webhook
 // - Redeem: Key validieren (optional Lemon API), einmalig konsumieren, Seat anlegen
 // - Status / Assign / Release / RemoveSeat
-// - Webhook: nur Lock/Unlock (Abo) + Optional Key/Seat de-/aktiv markieren
-// - Optionales Billing-Portal
+// - Webhook: Lock/Unlock (Abo) + Seat paymentActive/revoked + harte Lock-Neuberechnung
+// - Billing-Portal Redirect
 // ============================================================================
 
 const express = require('express');
@@ -14,7 +13,7 @@ const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
 
-// Node >=18 hat global fetch. Falls nicht, nachladen.
+// Node >=18: global fetch; fallback:
 let fetchFn = global.fetch;
 if (typeof fetchFn !== 'function') {
   try { fetchFn = require('node-fetch'); } catch(_){ /* ignore */ }
@@ -24,10 +23,8 @@ const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Env -------------------------------------------------------------------
-// Lemon API (Test ODER Live). Wenn leer, läuft Redeem nur lokal (kein Lemon-Check).
 const LEMON_KEY       = process.env.LEMONSQUEEZY_API_KEY || '';
 const LEMON_VALIDATE  = String(process.env.LEMON_VALIDATE || (LEMON_KEY ? 'true' : 'false')).toLowerCase()==='true';
-// Webhook-Signierung (nur für Lock/Unlock & Key-Status)
 const LEMONS_SIGNING_SECRET = process.env.LEMONSQUEEZY_SIGNING_SECRET || '';
 
 const DATA_FILE = process.env.DATA_FILE
@@ -72,7 +69,7 @@ db = {
       locked:false, lockReason:null
     }
   },
-  redeemedGlobal: { "<keyLC>": { at, byEmail } } // verhindert doppeltes Einlösen global
+  redeemedGlobal: { "<keyLC>": { at, byEmail } }
 }
 */
 function loadDb(){
@@ -116,11 +113,31 @@ function recalc(acc){
   acc.totalSeats = seats.length;
   return acc;
 }
+function hasAnyUnpaid(acc){
+  return (acc?.seats||[]).some(s => s?.paymentActive === false);
+}
+function enforceLockForAccount(acc){
+  const anyUnpaid = hasAnyUnpaid(acc);
+  if (anyUnpaid) {
+    acc.locked = true;
+    if (!acc.lockReason || acc.lockReason === 'subscription_event_unlock') {
+      acc.lockReason = 'seat_unpaid';
+    }
+  } else {
+    if (acc.locked && (acc.lockReason === 'seat_unpaid' || !acc.lockReason)) {
+      // Entsperre nur, wenn der Lock durch unpaid verursacht war
+      acc.locked = false;
+      acc.lockReason = null;
+    }
+  }
+}
 function setLockForEmail(email, locked, reason=null){
   const db  = loadDb();
   const acc = ensureAcc(db, email);
   acc.locked = !!locked;
-  acc.lockReason = reason ? String(reason) : null;
+  acc.lockReason = reason ? String(reason) : (locked ? 'forced_lock' : null);
+  // Nach externer Lock-Entscheidung trotzdem unpaid prüfen
+  enforceLockForAccount(acc);
   saveDb(db);
   log(`[Licenses] ${locked?'LOCKED':'UNLOCKED'} ${email} ${reason?'- '+reason:''}`);
 }
@@ -161,7 +178,10 @@ app.get('/api/licenses/status', (req, res)=>{
 
   const db  = loadDb();
   const acc = ensureAcc(db, email);
+  // Erzwinge Lock, falls Seats unpaid (auch ohne Webhook)
+  enforceLockForAccount(acc);
   recalc(acc);
+  saveDb(db);
 
   res.json({
     ok:true,
@@ -191,14 +211,16 @@ app.post('/api/licenses/assign', (req, res)=>{
   const db  = loadDb();
   const acc = ensureAcc(db, email);
 
-  if (acc.locked) return res.status(403).json({ ok:false, msg:'account_locked' });
+  // Harte Sperre: unpaid oder explizit locked
+  enforceLockForAccount(acc);
+  if (acc.locked) { saveDb(db); return res.status(403).json({ ok:false, msg:'account_locked' }); }
 
   if (acc.seats.find(s=>s.assignedToModelId === modelId)){
+    recalc(acc); saveDb(db);
     return res.json({ ok:true, msg:'already assigned' });
   }
-  // nur Seats verwenden, die paymentActive sind (oder kein Flag haben = true) und nicht revoked sind
   const free = acc.seats.find(s=>!s.assignedToModelId && (s.revoked!==true) && (s.paymentActive!==false));
-  if (!free) return res.status(409).json({ ok:false, msg:'no free seat' });
+  if (!free) { recalc(acc); saveDb(db); return res.status(409).json({ ok:false, msg:'no free seat' }); }
 
   free.assignedToModelId   = modelId;
   free.assignedToModelName = modelName || null;
@@ -218,7 +240,7 @@ app.post('/api/licenses/release', (req, res)=>{
   const acc = ensureAcc(db, email);
 
   const seat = acc.seats.find(s=>s.assignedToModelId === modelId);
-  if (!seat) return res.json({ ok:true, msg:'already free' });
+  if (!seat) { recalc(acc); saveDb(db); return res.json({ ok:true, msg:'already free' }); }
 
   seat.assignedToModelId   = null;
   seat.assignedToModelName = null;
@@ -240,9 +262,11 @@ app.post('/api/licenses/remove_seat', (req, res)=>{
   const idx = acc.seats.findIndex(s=>String(s.id)===seatId);
   if (idx<0) return res.status(404).json({ ok:false, msg:'seat_not_found' });
 
-  // Wichtig: Key bleibt als redeemed im Register -> kann nicht erneut eingelöst werden
   acc.seats.splice(idx,1);
-  recalc(acc); saveDb(db);
+
+  recalc(acc);
+  enforceLockForAccount(acc);
+  saveDb(db);
   res.json({ ok:true });
 });
 
@@ -257,32 +281,30 @@ app.post('/api/licenses/redeem', async (req, res)=>{
     const db  = loadDb();
     const acc = ensureAcc(db, email);
 
-    if (acc.locked) return res.status(403).json({ ok:false, error:'account_locked' });
+    // Harte Sperre: unpaid Seats blockieren Redeem
+    enforceLockForAccount(acc);
+    if (acc.locked) { saveDb(db); return res.status(403).json({ ok:false, error:'account_locked' }); }
 
-    // 1) global bereits eingelöst?
     if (db.redeemedGlobal && db.redeemedGlobal[key]) {
       const info = db.redeemedGlobal[key];
       return res.status(409).json({ ok:false, error:'key_already_redeemed', by:info.byEmail, at:info.at });
     }
-    // 2) im selben Account bereits eingelöst?
     if (acc.redeemedKeys && acc.redeemedKeys[key]) {
       const info = acc.redeemedKeys[key];
       return res.status(409).json({ ok:false, error:'key_already_redeemed_in_account', by:info.byEmail, at:info.at });
     }
 
-    // 3) Optional: gegen Lemon prüfen
     const lr = await findLicenseKeyOnLemon(key);
     if (!lr.ok) {
       return res.status(400).json({ ok:false, error:'invalid_key' });
     }
 
-    // 4) Seat erzeugen (unassigned) & Key markieren
     const seat = {
       id: crypto.randomUUID(),
       assignedToModelId:   null,
       assignedToModelName: null,
       sourceKey: key,
-      paymentActive: true,  // bei Einlösen aktiv
+      paymentActive: true,
       revoked: false
     };
     acc.seats.push(seat);
@@ -291,7 +313,9 @@ app.post('/api/licenses/redeem', async (req, res)=>{
     acc.redeemedKeys[key]  = meta;
     db.redeemedGlobal[key] = meta;
 
-    recalc(acc); saveDb(db);
+    recalc(acc);
+    enforceLockForAccount(acc);
+    saveDb(db);
 
     return res.json({ ok:true, seatId: seat.id, totalSeats: acc.totalSeats, usedSeats: acc.usedSeats });
   }catch(e){
@@ -307,13 +331,14 @@ app.get('/api/licenses/rebuild', async (req, res)=>{
   const db  = loadDb();
   const acc = ensureAcc(db, email);
   recalc(acc);
+  enforceLockForAccount(acc);
+  saveDb(db);
   res.json({ ok:true, email, totalSeats:acc.totalSeats, usedSeats:acc.usedSeats, seats:acc.seats, locked:!!acc.locked, lockReason:acc.lockReason||null });
 });
 
 // ============================================================================
 // =======================  WEBHOOK: Lock / Key-Status  =======================
 // ============================================================================
-// RAW-Body NUR für diese Route (HMAC-Verifikation)
 app.use('/api/lemon/webhook', express.raw({ type: 'application/json' }));
 
 app.post('/api/lemon/webhook', (req, res) => {
@@ -340,7 +365,6 @@ app.post('/api/lemon/webhook', (req, res) => {
     const attr      = payload?.data?.attributes || {};
     const email     = safeLC(attr?.user_email || attr?.email || '');
 
-    // 1) Account Lock/Unlock über Subscriptions
     const badEvents = new Set([
       'subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused','subscription_past_due'
     ]);
@@ -348,43 +372,49 @@ app.post('/api/lemon/webhook', (req, res) => {
       'subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created'
     ]);
 
+    const db  = loadDb();
+    let acc   = email ? ensureAcc(db, email) : null;
+
+    // 1) Lock/Unlock basierend auf Subscription-Events
     if (email) {
       if (badEvents.has(eventName)) {
-        setLockForEmail(email, true, eventName);
+        if (!acc) acc = ensureAcc(db, email);
+        acc.locked = true;
+        acc.lockReason = eventName;
       } else if (goodEvents.has(eventName)) {
-        const status = String(attr?.status || '').toLowerCase();
-        if (!status || status==='active' || status==='on_trial') setLockForEmail(email, false, null);
+        if (!acc) acc = ensureAcc(db, email);
+        // nur entsperren, wenn später keine unpaid Seats mehr bestehen
+        acc.lockReason = 'subscription_event_unlock';
+        // unlock erfolgt nach enforceLockForAccount()
       }
     }
 
-    // 2) Optional: Key/Seat aktiv/deaktiv (falls LS solche Events liefert)
-    // Hinweis: Je nach LS-Plan/Setup können folgende Events vorkommen:
-    // - 'license_key_created', 'license_key_updated', 'license_key_deleted'
-    // - Manche Anbieter markieren Keys 'disabled' bei Refunds/Chargebacks
+    // 2) Key/Seat-Status aus Events übernehmen (falls vorhanden)
     const keyFromPayload =
-      safeLC(payload?.data?.attributes?.key) || // bei license_key_*
+      safeLC(payload?.data?.attributes?.key) ||
       safeLC(payload?.included?.find?.(x=>x?.type==='license-keys')?.attributes?.key || '');
 
-    if (keyFromPayload) {
-      const db  = loadDb();
-      const acc = email ? ensureAcc(db, email) : null;
-      if (acc) {
-        const seat = acc.seats.find(s => safeLC(s.sourceKey) === keyFromPayload);
-        if (seat) {
-          if (eventName === 'license_key_deleted' || eventName === 'license_key_disabled' || eventName === 'order_refunded') {
-            seat.paymentActive = false;
-            seat.revoked = true;
-          }
-          if (eventName === 'license_key_updated') {
-            // Falls Attribut 'status' existiert, kannst du hier granular reagieren:
-            const kStatus = String(attr?.status||'').toLowerCase();
-            if (kStatus==='enabled' || kStatus==='active') { seat.paymentActive = true; seat.revoked = false; }
-            if (kStatus==='disabled' || kStatus==='revoked') { seat.paymentActive = false; seat.revoked = true; }
-          }
-          saveDb(db);
+    if (acc && keyFromPayload) {
+      const seat = acc.seats.find(s => safeLC(s.sourceKey) === keyFromPayload);
+      if (seat) {
+        if (eventName === 'license_key_deleted' || eventName === 'license_key_disabled' || eventName === 'order_refunded') {
+          seat.paymentActive = false;
+          seat.revoked = true;
+        }
+        if (eventName === 'license_key_updated') {
+          const kStatus = String(attr?.status||'').toLowerCase();
+          if (kStatus==='enabled' || kStatus==='active') { seat.paymentActive = true; seat.revoked = false; }
+          if (kStatus==='disabled' || kStatus==='revoked') { seat.paymentActive = false; seat.revoked = true; }
         }
       }
     }
+
+    // 3) Harte Lock-Neuberechnung (Seats unpaid => lock)
+    if (acc) {
+      recalc(acc);
+      enforceLockForAccount(acc);
+    }
+    saveDb(db);
 
     return res.status(200).send('ok');
   } catch (err) {
