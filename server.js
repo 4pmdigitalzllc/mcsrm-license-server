@@ -2,11 +2,11 @@
 // ============================================================================
 // Multi-Session CRM License Server (Redeem-only)
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
-// - KEIN Webhook/Auto-Seats mehr
-// - Redeem: Key validieren (Lemon API), einmalig konsumieren, Seat anlegen
+// - KEIN Webhook / KEIN Auto-Insert
+// - Redeem: Key validieren (optional Lemon API), einmalig konsumieren, Seat anlegen
 // - Status / Assign / Release
 // - (No-Op) Rebuild
-// - Optionales Billing-Portal (falls du es später brauchst)
+// - Optionales Billing-Portal
 // ============================================================================
 
 const express = require('express');
@@ -14,21 +14,41 @@ const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
 
+// Node >=18 hat global fetch. Falls nicht, ausnahmsweise nachladen.
+let fetchFn = global.fetch;
+if (typeof fetchFn !== 'function') {
+  try { fetchFn = require('node-fetch'); } catch(_){ /* bleibt undefined */ }
+}
+
 const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Env -------------------------------------------------------------------
-const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';  // MUSS gesetzt sein (Test ODER Live)
+// Wenn du Lemon-Validierung willst, setze LEMONSQUEEZY_API_KEY (Test ODER Live).
+// Falls leer, läuft die Redeem-Logik rein lokal (Doppelverwendung wird trotzdem verhindert).
+const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';
+const LEMON_VALIDATE= String(process.env.LEMON_VALIDATE || (LEMON_KEY ? 'true' : 'false')).toLowerCase()==='true';
+
 const DATA_FILE     = process.env.DATA_FILE
   ? process.env.DATA_FILE
   : path.join(process.cwd(), 'licenses.json');
+
 const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim(); // optional für /billing
 
 // ---- Utils -----------------------------------------------------------------
 function nowIso(){ return new Date().toISOString(); }
 function ensureDirForFile(file){ try{ fs.mkdirSync(path.dirname(file), { recursive:true }); }catch{} }
-function log(...a){ console.log(...a); }
 function safeLC(s){ return String(s||'').trim().toLowerCase(); }
+function log(...a){ console.log(...a); }
+
+// ---- Basic CORS (für Aufrufe aus deiner App/Renderer) ----------------------
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Headers','content-type');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  next();
+});
 
 // ---- Health ----------------------------------------------------------------
 app.get('/',       (req,res)=>res.status(200).send('OK'));
@@ -47,7 +67,7 @@ app.use(express.json());
         redeemedKeys: { "<keyLC>": { at, byEmail } }
       }
     },
-    redeemedGlobal: { "<keyLC>": { at, byEmail } }  // verhindert doppeltes Einlösen über Accounts hinweg
+    redeemedGlobal: { "<keyLC>": { at, byEmail } }  // verhindert doppeltes Einlösen account-übergreifend
   }
 */
 function loadDb(){
@@ -87,12 +107,12 @@ function recalc(acc){
   return acc;
 }
 
-// ---- Lemon API (read-only) -------------------------------------------------
+// ---- Lemon API (read-only, optional) ---------------------------------------
 async function lemonFetch(v1Path, params = {}){
-  if (!LEMON_KEY) throw new Error('LEMONSQUEEZY_API_KEY missing');
+  if (!LEMON_VALIDATE || !LEMON_KEY || !fetchFn) return { ok:false, status:0, data:[] };
   const url = new URL(`https://api.lemonsqueezy.com/v1/${v1Path}`);
   Object.entries(params||{}).forEach(([k,v])=> url.searchParams.set(k, String(v)));
-  const r = await fetch(url, { headers:{
+  const r = await fetchFn(url, { headers:{
     Authorization: `Bearer ${LEMON_KEY}`,
     Accept: 'application/vnd.api+json'
   }});
@@ -106,10 +126,13 @@ async function lemonFetch(v1Path, params = {}){
 }
 
 async function findLicenseKeyOnLemon(key){
+  if (!LEMON_VALIDATE) return { ok:true }; // Validierung bewusst aus
   const resp = await lemonFetch('license-keys', { 'filter[key]': key });
   const item = Array.isArray(resp?.data) && resp.data[0] ? resp.data[0] : null;
   if (!item) return { ok:false, reason:'not_found' };
-  // Du könntest hier auf item.attributes.status prüfen (falls vorhanden)
+  // Optional: Status prüfen (falls benötigt)
+  // const status = String(item?.attributes?.status || '').toLowerCase();
+  // if (status && status !== 'active') return { ok:false, reason:`status_${status}` };
   return { ok:true, item };
 }
 
@@ -159,7 +182,7 @@ app.post('/api/licenses/assign', (req, res)=>{
   res.json({ ok:true, seatId: free.id });
 });
 
-// ---- LICENSE RELEASE -------------------------------------------------------
+// ---- LICENSE RELEASE --------------------------------------------------------
 app.post('/api/licenses/release', (req, res)=>{
   const email   = safeLC(req.body?.email);
   const modelId = req.body?.modelId;
@@ -190,24 +213,24 @@ app.post('/api/licenses/redeem', async (req, res)=>{
     const db  = loadDb();
     const acc = ensureAcc(db, email);
 
-    // global bereits eingelöst?
-    if (db.redeemedGlobal[key]) {
+    // 1) global bereits eingelöst?
+    if (db.redeemedGlobal && db.redeemedGlobal[key]) {
       const info = db.redeemedGlobal[key];
       return res.status(409).json({ ok:false, error:'key_already_redeemed', by:info.byEmail, at:info.at });
     }
-    // im selben Account bereits eingelöst?
-    if (acc.redeemedKeys[key]) {
+    // 2) im selben Account bereits eingelöst?
+    if (acc.redeemedKeys && acc.redeemedKeys[key]) {
       const info = acc.redeemedKeys[key];
       return res.status(409).json({ ok:false, error:'key_already_redeemed_in_account', by:info.byEmail, at:info.at });
     }
 
-    // bei Lemon prüfen, ob Key existiert
+    // 3) Optional: gegen Lemon prüfen
     const lr = await findLicenseKeyOnLemon(key);
     if (!lr.ok) {
       return res.status(400).json({ ok:false, error:'invalid_key' });
     }
 
-    // Seat erzeugen (unassigned) & Key markieren
+    // 4) Seat erzeugen (unassigned) & Key markieren
     const seat = {
       id: crypto.randomUUID(),
       assignedToModelId:   null,
@@ -217,8 +240,8 @@ app.post('/api/licenses/redeem', async (req, res)=>{
     acc.seats.push(seat);
 
     const meta = { at: nowIso(), byEmail: email };
-    acc.redeemedKeys[key]   = meta;
-    db.redeemedGlobal[key]  = meta;
+    acc.redeemedKeys[key]  = meta;
+    db.redeemedGlobal[key] = meta;
 
     recalc(acc); saveDb(db);
 
@@ -239,7 +262,7 @@ app.get('/api/licenses/rebuild', async (req, res)=>{
   res.json({ ok:true, email, totalSeats:acc.totalSeats, usedSeats:acc.usedSeats, seats:acc.seats });
 });
 
-// ---- Optional: Billing-Portal (falls du es doch brauchst) ------------------
+// ---- Optional: Billing-Portal (falls du es brauchst) -----------------------
 function createPortalSession(email) {
   if (!LEMONS_STORE) return { ok:false, msg:'LEMONS_STORE missing' };
   const base = `https://${LEMONS_STORE}.lemonsqueezy.com/billing`;
