@@ -2,10 +2,10 @@
 // ============================================================================
 // Multi-Session CRM License Server (Express)
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
-// - Lemon Squeezy Webhook (Seats + Account-Lock)  [ROBUSTER QTY-PARSER + SUB]
-// - Rebuild-Route (Seats aus Lemon-API rekonstruieren)
+// - Lemon Squeezy Webhook (Seats + Account-Lock)
+// - Rebuild-Route (Seats aus Lemon-API rekonstruieren; geschützt gegen "Nullen")
 // - Status / Assign / Release
-// - Billing-Portal Session via Lemon API (/api/billing/portal/session)
+// - Billing-Portal Redirect (ohne Lemon-Portal-API)
 // ============================================================================
 
 const express = require('express');
@@ -13,16 +13,13 @@ const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
 
-// Node 18+: global fetch verfügbar. Falls nicht, aus node-fetch importieren.
-// const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
-
 const app  = express();
 const port = process.env.PORT || 10000;
 
 // ---- Env -------------------------------------------------------------------
 const SECRET        = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook HMAC
 const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim();       // z.B. "4pmdigitalz"
-const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild/Portal
+const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild
 const DATA_FILE     = process.env.DATA_FILE
   ? process.env.DATA_FILE
   : path.join(process.cwd(), 'licenses.json');
@@ -91,9 +88,9 @@ function recalc(acc){
   return acc;
 }
 function resizeSeatsPreservingAssignments(acc, target){
-  const current = acc.seats || [];
+  const current  = acc.seats || [];
   const assigned = current.filter(s => !!s.assignedToModelId);
-  const newSeats = Array.from({ length: target }).map((_, i) => {
+  const newSeats = Array.from({ length: Math.max(0, Number(target)||0) }).map((_, i) => {
     const prev = assigned[i];
     return prev ? { ...prev } : { id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null };
   });
@@ -104,7 +101,6 @@ function resizeSeatsPreservingAssignments(acc, target){
 // ============================================================================
 // ==============  LEMON SQUEEZY WEBHOOK  =====================================
 // ============================================================================
-// RAW Body NUR für diese Route (für HMAC-Verifikation)
 app.use('/api/lemon/webhook', express.raw({ type: 'application/json' }));
 
 app.post('/api/lemon/webhook', async (req, res) => {
@@ -134,21 +130,9 @@ app.post('/api/lemon/webhook', async (req, res) => {
 
     console.log(`[${nowIso()}][Webhook] ${eventName} for ${email||'-'}`);
 
-    // ===== Seats hinzufügen bei Orders (robustere Mengen-Extraktion)
+    // Seats hinzufügen bei einmaligen Orders (order_created)
     if (eventName === 'order_created') {
-      let qty = 0;
-
-      // 1) klassisch
-      qty = Number(attr?.first_order_item?.quantity || 0);
-
-      // 2) Fallbacks
-      if (!qty) qty = Number(attr?.total_variants_quantity || 0);
-      if (!qty && Array.isArray(payload?.included)) {
-        qty = payload.included
-          .filter(i => i?.type === 'order-items')
-          .reduce((s, i) => s + Number(i?.attributes?.quantity || 0), 0);
-      }
-
+      const qty = Number(attr?.first_order_item?.quantity || 1);
       if (email && qty > 0){
         const db  = loadDb();
         const acc = ensureAcc(db, email);
@@ -157,27 +141,10 @@ app.post('/api/lemon/webhook', async (req, res) => {
         }
         recalc(acc); saveDb(db);
         console.log(`[Webhook] order_created +${qty} seat(s) -> total=${acc.totalSeats}`);
-      } else {
-        console.log('[Webhook] order_created without email/qty', { email, qty });
       }
     }
 
-    // ===== Seats bei Sub-Creation anlegen (manche Stores feuern nur Sub-Events)
-    if (eventName === 'subscription_created') {
-      let qty = Number(attr?.quantity || attr?.variant_quantity || 0);
-      if (!qty) qty = 1; // Fallback
-      if (email && qty > 0) {
-        const db  = loadDb();
-        const acc = ensureAcc(db, email);
-        for (let i=0;i<qty;i++){
-          acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
-        }
-        recalc(acc); saveDb(db);
-        console.log(`[Webhook] (sub_created) +${qty} seat(s) -> total=${acc.totalSeats}`);
-      }
-    }
-
-    // ===== Lock/Unlock nach Sub-Status + Rebuild
+    // Lock/Unlock nach Sub-Status
     const badEvents = new Set(['subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused']);
     const goodEvents= new Set(['subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created']);
 
@@ -189,7 +156,7 @@ app.post('/api/lemon/webhook', async (req, res) => {
         if (!status || status==='active' || status==='on_trial') setLockForEmail(email, false, null);
       }
 
-      // Sicherheitsnetz: Seats aus Lemon neu spiegeln
+      // Sicherheitsnetz: Bei Sub-Events (good/bad) Seats aus Lemon neu spiegeln
       try{ await rebuildSeatsFromLemon(email); }catch(e){ console.warn('[Webhook] rebuild skip:', e?.message||e); }
     }
 
@@ -211,26 +178,53 @@ async function lemonFetch(v1Path, params = {}){
   Object.entries(params||{}).forEach(([k,v])=> url.searchParams.set(k, String(v)));
   const r = await fetch(url, { headers:{
     Authorization: `Bearer ${LEMON_KEY}`,
-    Accept: 'application/vnd.api+json',
-    'Content-Type': 'application/json'
+    Accept: 'application/vnd.api+json'
   }});
   if (!r.ok) throw new Error(`Lemon ${v1Path} ${r.status}`);
   return r.json();
 }
+
+// --- NEU: Customer-ID via E-Mail auflösen -----------------------------------
+async function getCustomerIdByEmail(email){
+  const data = await lemonFetch('customers', { 'filter[email]': email });
+  const list = Array.isArray(data?.data) ? data.data : [];
+  const id   = list[0]?.id || null;
+  return id;
+}
+
+// --- Bestell-Seats über customer_id (Fallback: email) -----------------------
 async function getSeatsFromOrders(email){
   try{
-    const data = await lemonFetch('orders', { 'filter[customer_email]': email });
+    const cid = await getCustomerIdByEmail(email);
+    if (!cid) return 0;
+
+    const data = await lemonFetch('orders', { 'filter[customer_id]': cid });
     const list = Array.isArray(data?.data) ? data.data : [];
     return list.reduce((sum, o)=>{
       const q = o?.attributes?.total_quantity ?? o?.attributes?.quantity ?? 0;
-      return sum + (Number(q)||0);
+      return sum + (Number(q) || 0);
     }, 0);
-  }catch{ return 0; }
+  }catch(e){
+    console.warn('[Orders] fallback by email', e?.message||e);
+    try{
+      const data = await lemonFetch('orders', { 'filter[email]': email });
+      const list = Array.isArray(data?.data) ? data.data : [];
+      return list.reduce((sum,o)=>{
+        const q = o?.attributes?.total_quantity ?? o?.attributes?.quantity ?? 0;
+        return sum + (Number(q)||0);
+      },0);
+    }catch{ return 0; }
+  }
 }
+
+// --- Abo-Seats über customer_id + status=active (Fallback: email) -----------
 async function getSeatsFromSubscriptions(email){
   try{
+    const cid = await getCustomerIdByEmail(email);
+    if (!cid) return 0;
+
     const data = await lemonFetch('subscriptions', {
-      'filter[customer_email]': email,
+      'filter[customer_id]': cid,
       'filter[status]': 'active'
     });
     const list = Array.isArray(data?.data) ? data.data : [];
@@ -238,21 +232,44 @@ async function getSeatsFromSubscriptions(email){
       const q = s?.attributes?.quantity ?? s?.attributes?.variant_quantity ?? 1;
       return sum + (Number(q)||0);
     }, 0);
-  }catch{ return 0; }
+  }catch(e){
+    console.warn('[Subs] fallback by email', e?.message||e);
+    try{
+      const data = await lemonFetch('subscriptions', {
+        'filter[email]': email,
+        'filter[status]': 'active'
+      });
+      const list = Array.isArray(data?.data) ? data.data : [];
+      return list.reduce((sum, s)=>{
+        const q = s?.attributes?.quantity ?? s?.attributes?.variant_quantity ?? 1;
+        return sum + (Number(q)||0);
+      }, 0);
+    }catch{ return 0; }
+  }
 }
-/** Baut Seats aus Lemon neu auf (erhält vorhandene Assignments soweit möglich) */
+
+/** Baut Seats aus Lemon neu auf (erhält vorhandene Assignments; schützt gegen API-0) */
 async function rebuildSeatsFromLemon(email){
   const key = String(email||'').toLowerCase();
   if (!key) throw new Error('email required');
-  const shouldTotal = (await getSeatsFromOrders(key)) + (await getSeatsFromSubscriptions(key));
+
+  const shouldOrders = await getSeatsFromOrders(key);
+  const shouldSubs   = await getSeatsFromSubscriptions(key);
+  const shouldTotal  = (shouldOrders || 0) + (shouldSubs || 0);
 
   const db  = loadDb();
   const acc = ensureAcc(db, key);
-  if (shouldTotal < 0) return recalc(acc);
+  const currentTotal = Array.isArray(acc.seats) ? acc.seats.length : 0;
+
+  // Niemals "auf 0 syncen", wenn API gerade nichts liefert
+  if (shouldTotal <= 0 && currentTotal > 0) {
+    console.log(`[Rebuild] ${key} -> keep current (${currentTotal}) because API total=0`);
+    recalc(acc); saveDb(db); return acc;
+  }
 
   resizeSeatsPreservingAssignments(acc, shouldTotal);
   saveDb(db);
-  console.log(`[Rebuild] ${key} -> totalSeats=${acc.totalSeats}, used=${acc.usedSeats}`);
+  console.log(`[Rebuild] ${key} -> totalSeats=${acc.totalSeats}, used=${acc.usedSeats} (orders=${shouldOrders}, subs=${shouldSubs})`);
   return acc;
 }
 
@@ -342,36 +359,39 @@ app.get('/api/licenses/rebuild', async (req, res)=>{
 });
 
 // ============================================================================
-// =======  BILLING-PORTAL (Manage Licenses) — Session via Lemon API ==========
-async function createPortalSessionApi(email) {
-  if (!LEMON_KEY) return { ok:false, msg:'LEMONSQUEEZY_API_KEY missing' };
-  if (!email)     return { ok:false, msg:'email missing' };
-
-  const res = await fetch('https://api.lemonsqueezy.com/v1/billing-portal', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${LEMON_KEY}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      data: { type: 'billing-portal', attributes: { email } }
-    })
-  });
-
-  const j = await res.json().catch(()=>null);
-  const url = j?.data?.attributes?.url;
-  if (!res.ok || !url) {
-    console.error('[Portal API] error', res.status, j);
-    return { ok:false, msg:'api error' };
-  }
+// =======  BILLING-PORTAL (Manage Licenses / Billing) — ohne Portal-API ======
+function createPortalSession(email) {
+  if (!LEMONS_STORE) return { ok:false, msg:'LEMONS_STORE missing' };
+  const base = `https://${LEMONS_STORE}.lemonsqueezy.com/billing`;
+  const url  = email ? `${base}?email=${encodeURIComponent(email)}` : base;
   return { ok:true, url };
 }
 
-// Redirect-Route (ideal für window.open)
-app.get('/api/billing/portal/session', async (req, res) => {
+// JSON-Variante (optional)
+app.all('/api/licenses/portal', async (req, res) => {
+  try {
+    const email = String(
+      req.method === 'POST' ? req.body?.email : req.query?.email
+    ).trim().toLowerCase();
+    const out = createPortalSession(email);
+    if (!out.ok) return res.status(500).json(out);
+    return res.json(out);
+  } catch (e) {
+    console.error('[Portal] route error:', e);
+    return res.status(500).json({ ok:false, msg:'route error' });
+  }
+});
+
+// Redirect-Endpunkte für window.open()
+app.get('/api/billing/portal', (req, res) => {
   const email = String(req.query.email||'').trim().toLowerCase();
-  const out = await createPortalSessionApi(email);
+  const out = createPortalSession(email);
+  if (!out.ok) return res.status(500).json(out);
+  return res.redirect(302, out.url);
+});
+app.post('/api/billing/portal', (req, res) => {
+  const email = String(req.body?.email||'').trim().toLowerCase();
+  const out = createPortalSession(email);
   if (!out.ok) return res.status(500).json(out);
   return res.redirect(302, out.url);
 });
