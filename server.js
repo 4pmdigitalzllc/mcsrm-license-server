@@ -1,11 +1,12 @@
 // server.js
 // ============================================================================
-// Multi-Session CRM License Server (Express)
+// Multi-Session CRM License Server (Express) – MANUAL REDEEM EDITION
 // - Persistente Mini-DB (Render Disk via DATA_FILE)
-// - Lemon Squeezy Webhook (Seats + Account-Lock)
-// - Safe Rebuild (überschreibt lokale Seats NICHT, wenn Lemon 0/Fehler liefert)
+// - Lemon Squeezy Webhook NUR für Lock/Unlock (KEIN Seat-Autopush)
+// - Redeem-Flow: /api/licenses/redeem validiert Key (optional via Lemon API) & erstellt Seat
 // - Status / Assign / Release
 // - Billing-Portal Redirect
+// - Idempotenz: gleiche event_id & gleicher Lizenz-Key werden nur einmal verarbeitet
 // ============================================================================
 
 const express = require('express');
@@ -19,17 +20,17 @@ const port = process.env.PORT || 10000;
 // ---- Env -------------------------------------------------------------------
 const SECRET        = process.env.LEMONSQUEEZY_SIGNING_SECRET || ''; // Webhook HMAC
 const LEMONS_STORE  = (process.env.LEMONS_STORE || '').trim();       // z.B. "4pmdigitalz"
-const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für Rebuild
+const LEMON_KEY     = process.env.LEMONSQUEEZY_API_KEY || '';        // API für (optionale) Validierung
 const DATA_FILE     = process.env.DATA_FILE
   ? process.env.DATA_FILE
   : path.join(process.cwd(), 'licenses.json');
-const REBUILD_ON_EVENTS = String(process.env.LEMON_REBUILD_ON_EVENTS || 'false').toLowerCase()==='true';
 
 // ---- Utils -----------------------------------------------------------------
 function nowIso(){ return new Date().toISOString(); }
 function safeJsonParse(x){ try{ return JSON.parse(Buffer.isBuffer(x)?x.toString('utf8'):String(x||'{}')); }catch{return {}; } }
 function ensureDirForFile(file){ try{ fs.mkdirSync(path.dirname(file), { recursive:true }); }catch{} }
 function log(...a){ console.log(...a); }
+function uuid(){ return crypto.randomUUID(); }
 
 // ---- CORS (simple) ---------------------------------------------------------
 app.use((req, res, next) => {
@@ -45,6 +46,20 @@ app.get('/',       (req,res)=>res.status(200).send('OK'));
 app.get('/health', (req,res)=>res.status(200).send('ok'));
 
 // ---- Mini-DB (JSON-Datei auf persistenter Disk) ----------------------------
+/**
+ * Schema:
+ * {
+ *   accounts: {
+ *     [email]: {
+ *       seats: [{ id, assignedToModelId, assignedToModelName }],
+ *       redeemedKeys: [ "ABCD-EFGH-..." ],
+ *       processedEvents: [ "evt_..." ],   // idempotency for webhooks
+ *       locked: boolean,
+ *       lockReason: string|null
+ *     }
+ *   }
+ * }
+ */
 function loadDb(){
   try{
     if (fs.existsSync(DATA_FILE)) {
@@ -66,14 +81,20 @@ function ensureAcc(db, email){
   const key = String(email||'').toLowerCase();
   if (!db.accounts) db.accounts = {};
   if (!db.accounts[key]) db.accounts[key] = {
-    seats: [],                 // [{ id, assignedToModelId, assignedToModelName }]
+    seats: [],
+    redeemedKeys: [],
+    processedEvents: [],
     locked:false,
     lockReason:null
   };
-  if (typeof db.accounts[key].locked !== 'boolean') db.accounts[key].locked = false;
-  if (!('lockReason' in db.accounts[key])) db.accounts[key].lockReason = null;
-  if (!Array.isArray(db.accounts[key].seats)) db.accounts[key].seats = [];
-  return db.accounts[key];
+  const acc = db.accounts[key];
+  if (!Array.isArray(acc.seats)) acc.seats = [];
+  if (!Array.isArray(acc.redeemedKeys)) acc.redeemedKeys = [];
+  if (!Array.isArray(acc.processedEvents)) acc.processedEvents = [];
+  if (typeof acc.locked !== 'boolean') acc.locked = false;
+  if (!('lockReason' in acc)) acc.lockReason = null;
+  recalc(acc);
+  return acc;
 }
 function setLockForEmail(email, locked, reason=null){
   const db  = loadDb();
@@ -88,16 +109,6 @@ function recalc(acc){
   acc.usedSeats  = seats.filter(s => !!s.assignedToModelId).length;
   acc.totalSeats = seats.length;
   return acc;
-}
-function resizeSeatsPreservingAssignments(acc, target){
-  const current = acc.seats || [];
-  const assigned = current.filter(s => !!s.assignedToModelId);
-  const newSeats = Array.from({ length: target }).map((_, i) => {
-    const prev = assigned[i];
-    return prev ? { ...prev } : { id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null };
-  });
-  acc.seats = newSeats;
-  recalc(acc);
 }
 
 // ============================================================================
@@ -128,56 +139,51 @@ app.post('/api/lemon/webhook', async (req, res) => {
 
     const payload   = safeJsonParse(raw);
     const eventName = payload?.meta?.event_name || eventHdr || 'unknown';
+    const eventId   = payload?.meta?.event_id || payload?.meta?.id || payload?.id || null;
+
+    // Email (für Lock/Unlock relevant)
     const attr      = payload?.data?.attributes || {};
     const email     = String(attr?.user_email || attr?.email || '').toLowerCase();
 
-    console.log(`[${nowIso()}][Webhook] ${eventName} for ${email||'-'}`);
+    console.log(`[${nowIso()}][Webhook] ${eventName} ${eventId||''} for ${email||'-'}`);
 
-    // --- Seats SOFORT lokal anpassen (nicht auf Rebuild warten) -------------
-    const db  = loadDb();
-    const acc = email ? ensureAcc(db, email) : null;
-
-    // 1) einmalige Orders
-    if (acc && eventName === 'order_created') {
-      const qty = Number(attr?.first_order_item?.quantity || attr?.total_quantity || 1);
-      if (qty > 0){
-        for (let i=0;i<qty;i++){
-          acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
-        }
-        recalc(acc); saveDb(db);
-        console.log(`[Webhook] order_created +${qty} seat(s) -> total=${acc.totalSeats}`);
-      }
-    }
-
-    // 2) Lizenzschlüssel erstellt (Lemon sendet das im Testmode oft zusätzlich)
-    if (acc && eventName === 'license_key_created') {
-      acc.seats.push({ id: crypto.randomUUID(), assignedToModelId:null, assignedToModelName:null });
-      recalc(acc); saveDb(db);
-      console.log(`[Webhook] license_key_created +1 seat(s) -> total=${acc.totalSeats}`);
-    }
-
-    // 3) Sub-Events: Lock/Unlock + (optional) Safe-Rebuild
-    const badEvents = new Set(['subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused']);
-    const goodEvents= new Set(['subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created']);
+    // Ab hier: KEIN Seat-Autopush mehr!
+    // -> Wir nutzen Webhooks nur für Lock/Unlock und Idempotenz-Marker.
 
     if (email) {
-      if (badEvents.has(eventName)) {
-        setLockForEmail(email, true, eventName);
-      } else if (goodEvents.has(eventName)) {
-        const status = String(attr?.status || '').toLowerCase();
-        if (!status || status==='active' || status==='on_trial') setLockForEmail(email, false, null);
+      const db  = loadDb();
+      const acc = ensureAcc(db, email);
+
+      // Idempotenz der Events
+      if (eventId && acc.processedEvents.includes(eventId)) {
+        return res.status(200).send('already processed');
       }
 
-      // Nur wenn gewünscht: Rebuild – aber sicher!
-      if (REBUILD_ON_EVENTS) {
-        try{ await rebuildSeatsFromLemon(email); }catch(e){ console.warn('[Webhook] rebuild skip:', e?.message||e); }
+      // Lock/Unlock-Logik (wie gehabt)
+      const badEvents = new Set(['subscription_payment_failed','subscription_expired','subscription_cancelled','subscription_paused']);
+      const goodEvents= new Set(['subscription_payment_success','subscription_resumed','subscription_updated','subscription_renewed','subscription_created']);
+
+      if (badEvents.has(eventName)) {
+        acc.locked = true;
+        acc.lockReason = eventName;
+      } else if (goodEvents.has(eventName)) {
+        const status = String(attr?.status || '').toLowerCase();
+        if (!status || status==='active' || status==='on_trial') {
+          acc.locked = false;
+          acc.lockReason = null;
+        }
       }
+
+      // Event idempotent markieren & speichern
+      if (eventId) acc.processedEvents.push(eventId);
+      recalc(acc); saveDb(db);
     }
 
     return res.status(200).send('ok');
   } catch (err) {
     console.error('[Webhook] error:', err);
-    return res.status(500).send('error');
+    // 200 zurückgeben, um Lemon-Retries klein zu halten (wir sind idempotent)
+    return res.status(200).send('ok');
   }
 });
 
@@ -185,7 +191,7 @@ app.post('/api/lemon/webhook', async (req, res) => {
 // =========  ab hier normaler JSON-Parser & API  =============================
 app.use(express.json());
 
-// ---- Lemon API (read-only) für Rebuild -------------------------------------
+// ---- Lemon API (nur für optionale Redeem-Validierung / Portal) ------------
 async function lemonFetch(v1Path, params = {}){
   if (!LEMON_KEY) throw new Error('LEMONSQUEEZY_API_KEY missing');
   const url = new URL(`https://api.lemonsqueezy.com/v1/${v1Path}`);
@@ -194,70 +200,90 @@ async function lemonFetch(v1Path, params = {}){
     Authorization: `Bearer ${LEMON_KEY}`,
     Accept: 'application/vnd.api+json'
   }});
-  // Bei 401/403/404/400 keine Exception werfen – wir liefern leere Liste zurück,
-  // damit ein Safe-Rebuild NICHT lokale Seats auf 0 setzt.
   if (!r.ok) {
-    console.warn(`[Orders/Subs] lemon ${v1Path} returned ${r.status}`);
+    console.warn(`[Lemon API] ${v1Path} returned ${r.status}`);
     return { data: [] };
   }
   return r.json();
 }
-async function getSeatsFromOrders(email){
-  try{
-    const data = await lemonFetch('orders', { 'filter[customer_email]': email });
-    const list = Array.isArray(data?.data) ? data.data : [];
-    return list.reduce((sum, o)=>{
-      const q = o?.attributes?.total_quantity ?? o?.attributes?.quantity ?? 0;
-      return sum + (Number(q)||0);
-    }, 0);
-  }catch{ return null; }
-}
-async function getSeatsFromSubscriptions(email){
-  try{
-    const data = await lemonFetch('subscriptions', {
-      'filter[customer_email]': email,
-      'filter[status]': 'active'
-    });
-    const list = Array.isArray(data?.data) ? data.data : [];
-    return list.reduce((sum, s)=>{
-      const q = s?.attributes?.quantity ?? s?.attributes?.variant_quantity ?? 1;
-      return sum + (Number(q)||0);
-    }, 0);
-  }catch{ return null; }
-}
-/** Safe-Rebuild: überschreibt NICHT, wenn Lemon 0 oder Fehler liefert */
-async function rebuildSeatsFromLemon(email, opts={}){
-  const key = String(email||'').toLowerCase();
-  if (!key) throw new Error('email required');
 
-  const wantForce = !!opts.force;
-
-  const orders = await getSeatsFromOrders(key);
-  const subs   = await getSeatsFromSubscriptions(key);
-
-  const db  = loadDb();
-  const acc = ensureAcc(db, key);
-
-  if (orders===null && subs===null) {
-    console.warn('[Rebuild] both endpoints failed -> keep local seats');
-    recalc(acc); saveDb(db);
-    return acc;
+/**
+ * Optional: Lizenz-Key gegen Lemon prüfen.
+ * Versucht, den Key zu finden und Status zu validieren.
+ * Falls API-Key nicht gesetzt oder Lemon nichts liefert, entscheiden wir konservativ:
+ *  - Kein Treffer => invalid_key
+ *  - Treffer => ok
+ */
+async function validateLicenseKeyWithLemon(licenseKey){
+  if (!LEMON_KEY) {
+    // Ohne API-Key keine Online-Validierung möglich -> lass es den Client probieren
+    return { ok: true, meta: { checked:false } };
   }
-  const shouldTotal = Number(orders||0) + Number(subs||0);
+  try{
+    const data = await lemonFetch('license-keys', { 'filter[key]': licenseKey });
+    const list = Array.isArray(data?.data) ? data.data : [];
+    if (list.length === 0) return { ok:false, error:'invalid_key' };
 
-  // Safe: Wenn Lemon 0 meldet, wir lokal >0 haben und NICHT force – NICHT überschreiben
-  if (!wantForce && shouldTotal===0 && (acc.totalSeats||acc.seats.length)>0) {
-    console.warn('[Rebuild] Lemon said 0, local >0 -> keep local seats');
-    recalc(acc); saveDb(db);
-    console.log(`[Rebuild] ${key} -> (kept) totalSeats=${acc.totalSeats}, used=${acc.usedSeats}`);
-    return acc;
+    // Du könntest hier weitere Checks machen, z.B. status / deaktiviert etc.
+    // const attrs = list[0]?.attributes || {};
+    return { ok:true, meta:{ checked:true, count:list.length } };
+  }catch(e){
+    console.warn('[validateLicenseKeyWithLemon] error:', e?.message||e);
+    // Bei Fehler lieber nicht automatisch akzeptieren
+    return { ok:false, error:'validation_failed' };
   }
-
-  resizeSeatsPreservingAssignments(acc, shouldTotal);
-  saveDb(db);
-  console.log(`[Rebuild] ${key} -> totalSeats=${acc.totalSeats}, used=${acc.usedSeats}`);
-  return acc;
 }
+
+// ---- LICENSE REDEEM --------------------------------------------------------
+/**
+ * POST /api/licenses/redeem
+ * body: { email, licenseKey }
+ * - Prüft, ob Key schon redeemed wurde (global, nicht nur bei diesem Account)
+ * - Optional: validiert Key via Lemon API (wenn LEMON_KEY vorhanden)
+ * - Erst bei Erfolg wird ein neuer Seat erstellt
+ */
+app.post('/api/licenses/redeem', async (req, res) => {
+  try {
+    const email = String(req.body?.email||'').trim().toLowerCase();
+    const licenseKey = String(req.body?.licenseKey||'').trim().toUpperCase();
+
+    if (!email || !email.includes('@')) return res.status(400).json({ ok:false, error:'missing_email' });
+    if (!licenseKey) return res.status(400).json({ ok:false, error:'missing_license_key' });
+
+    const db  = loadDb();
+    // Globale Dup-Check über alle Accounts
+    for (const accEmail of Object.keys(db.accounts||{})) {
+      const acc = ensureAcc(db, accEmail);
+      if (acc.redeemedKeys.includes(licenseKey)) {
+        return res.json({ ok:false, error:'already_redeemed' });
+      }
+    }
+
+    // Optional: extern validieren
+    const val = await validateLicenseKeyWithLemon(licenseKey);
+    if (!val.ok) {
+      return res.json({ ok:false, error: val.error || 'invalid_key' });
+    }
+
+    const acc = ensureAcc(db, email);
+    // Nochmals acc-seitig prüfen (idempotenz)
+    if (acc.redeemedKeys.includes(licenseKey)) {
+      return res.json({ ok:false, error:'already_redeemed' });
+    }
+
+    // Seat erzeugen
+    const seat = { id: uuid(), assignedToModelId:null, assignedToModelName:null };
+    acc.seats.push(seat);
+    acc.redeemedKeys.push(licenseKey);
+    recalc(acc);
+    saveDb(db);
+
+    return res.json({ ok:true, totalSeats: acc.totalSeats, usedSeats: acc.usedSeats, seatId: seat.id });
+  } catch (e) {
+    console.error('[redeem] error', e);
+    return res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
 
 // ---- LICENSE STATUS --------------------------------------------------------
 app.get('/api/licenses/status', (req, res)=>{
@@ -274,6 +300,8 @@ app.get('/api/licenses/status', (req, res)=>{
     totalSeats: acc.totalSeats,
     usedSeats:  acc.usedSeats,
     seats:      acc.seats,
+    // Nur Info: wie viele Keys wurden eingelöst (== totalSeats)
+    redeemedKeys: acc.redeemedKeys,
     locked:     !!acc.locked,
     lockReason: acc.lockReason || null
   });
@@ -304,7 +332,7 @@ app.post('/api/licenses/assign', (req, res)=>{
   res.json({ ok:true, seatId: free.id });
 });
 
-// ---- LICENSE RELEASE -------------------------------------------------------
+// ---- LICENSE RELEASE --------------------------------------------------------
 app.post('/api/licenses/release', (req, res)=>{
   const email   = String(req.body?.email||'').toLowerCase();
   const modelId = req.body?.modelId;
@@ -324,12 +352,18 @@ app.post('/api/licenses/release', (req, res)=>{
   res.json({ ok:true });
 });
 
-// ---- REBUILD API (Recovery / Sync) ----------------------------------------
+// ---- REBUILD API (No-Op: kein externer Seat-Sync mehr) ---------------------
+/**
+ * Vorher: Seats anhand Orders/Subs ermittelt (führte zu Auto-Add).
+ * Jetzt: Rebuild ist bewusst "no-op" und gibt nur aktuellen lokalen Zustand zurück.
+ */
 app.get('/api/licenses/rebuild', async (req, res)=>{
   try{
     const email = String(req.query.email||'').toLowerCase();
     if (!email) return res.status(400).json({ ok:false, error:'email required' });
-    const acc = await rebuildSeatsFromLemon(email, { force: String(req.query.force||'')==='1' });
+    const db  = loadDb();
+    const acc = ensureAcc(db, email);
+    recalc(acc);
     res.json({
       ok:true, email,
       totalSeats: acc.totalSeats, usedSeats: acc.usedSeats, seats: acc.seats
